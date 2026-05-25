@@ -58,7 +58,7 @@ VulkanBenchmark::VulkanBenchmark() {
   application_info.applicationVersion = VK_MAKE_API_VERSION(0, 0, 0, 0);
   application_info.pEngineName = "vk_radix_sort";
   application_info.engineVersion = VK_MAKE_API_VERSION(0, 0, 0, 0);
-  application_info.apiVersion = VK_API_VERSION_1_4;
+  application_info.apiVersion = VK_API_VERSION_1_3;
 
   VkDebugUtilsMessengerCreateInfoEXT messenger_info = {
       VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
@@ -69,7 +69,7 @@ VulkanBenchmark::VulkanBenchmark() {
                                VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
   messenger_info.pfnUserCallback = DebugCallback;
 
-  std::vector<const char*> layers = {"VK_LAYER_KHRONOS_validation"};
+  std::vector<const char*> layers = {};
   std::vector<const char*> instance_extensions = {
       VK_EXT_DEBUG_UTILS_EXTENSION_NAME,
 #ifdef __APPLE__
@@ -126,16 +126,13 @@ VulkanBenchmark::VulkanBenchmark() {
   queue_infos[0].pQueuePriorities = queue_priorities.data();
 
   std::vector<const char*> device_extensions = {
+      VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 #ifdef __APPLE__
       "VK_KHR_portability_subset",
 #endif
   };
 
-  VkPhysicalDeviceVulkan14Features features14 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES};
-  features14.pushDescriptor = VK_TRUE;
-
   VkDeviceCreateInfo device_info = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-  device_info.pNext = &features14;
   device_info.queueCreateInfoCount = queue_infos.size();
   device_info.pQueueCreateInfos = queue_infos.data();
   device_info.enabledExtensionCount = device_extensions.size();

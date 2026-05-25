@@ -7,6 +7,9 @@ message(STATUS "Vulkan version: ${Vulkan_VERSION}")
 find_package(Python3 REQUIRED)
 include(FetchContent)
 
+option(BENCH_ENABLE_EMBREE_CUDA "Build Embree CUDA radix sort benchmark backend" OFF)
+set(BENCH_EMBREE_CUDA_ARCH "native" CACHE STRING "CUDA architecture for the Embree CUDA benchmark backend")
+
 # find slangc
 string(REPLACE glslangValidator slangc SLANGC_EXECUTABLE ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE})
 message(STATUS "slangc executable: ${SLANGC_EXECUTABLE}")
@@ -21,7 +24,7 @@ function(build_shader)
 
   get_filename_component(SHADER ${SHADER} ABSOLUTE)
 
-  add_custom_target(${OUTPUT} ALL
+  add_custom_target(${OUTPUT}
     COMMAND
       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/slangc_to_header.py
       -target spirv
@@ -48,7 +51,7 @@ build_shader(src/shader/spine.slang spine_slang)
 build_shader(src/shader/downsweep.slang downsweep_slang)
 build_shader(src/shader/downsweep.slang downsweep_key_value_slang KEY_VALUE)
 
-add_custom_target(vk_radix_sort_header ALL
+add_custom_target(vk_radix_sort_header
   COMMAND
     ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_header.py
     ${CMAKE_CURRENT_SOURCE_DIR}/src/vk_radix_sort.h.in
@@ -65,7 +68,8 @@ add_custom_target(vk_radix_sort_header ALL
   VERBATIM
 )
 
-add_dependencies(vk_radix_sort vk_radix_sort_header)
+# Use the checked-in generated header when building benchmarks without slangc.
+# add_dependencies(vk_radix_sort vk_radix_sort_header)
 
 # bench
 if(PROJECT_IS_TOP_LEVEL)
@@ -82,35 +86,22 @@ if(PROJECT_IS_TOP_LEVEL)
   )
   FetchContent_MakeAvailable(volk VulkanMemoryAllocator)
 
-  FetchContent_Declare(
-    fuchsia_radix_sort
-    GIT_REPOSITORY https://github.com/jaesung-cs/fuchsia_radix_sort.git
-    GIT_TAG        4a0425cf72d59b891936bb7f4c96e2d577abd63e
-  )
-  set(FUCHSIA_RADIX_SORT_USE_VOLK ON CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(fuchsia_radix_sort)
-
   set(BENCH_SOURCES
     bench/bench.cc
     bench/benchmark_factory.cc
     bench/cpu_benchmark.cc
     bench/data_generator.cc
-    bench/fuchsia_benchmark.cc
     bench/vma_impl.cc
     bench/volk_impl.cc
     bench/vrdx_impl.cc
     bench/vulkan_benchmark.cc
   )
 
-  #if CUDA is available, add CUB benchmark
-  include(CheckLanguage)
-  check_language(CUDA)
-  if(CMAKE_CUDA_COMPILER)
+  if(BENCH_ENABLE_EMBREE_CUDA)
     enable_language(CUDA)
-    set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    find_package(CUDAToolkit REQUIRED)
     list(APPEND BENCH_SOURCES
-      bench/cuda_benchmark.cu
+      bench/embree_cuda_benchmark.cu
     )
   endif()
 
@@ -122,22 +113,13 @@ if(PROJECT_IS_TOP_LEVEL)
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL"
   )
 
-  if(CMAKE_CUDA_COMPILER)
-    set_target_properties(bench PROPERTIES CUDA_ARCHITECTURES native)
-    if(MSVC)
-      target_compile_options(bench PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor /utf-8>
-        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor -Xcompiler=/utf-8>
-      )
-      target_link_options(bench PRIVATE
-        $<$<CONFIG:Debug>:/NODEFAULTLIB:LIBCMTD>
-        $<$<NOT:$<CONFIG:Debug>>:/NODEFAULTLIB:LIBCMT>
-      )
-    endif()
-    target_compile_definitions(bench PUBLIC BENCH_CUDA)
+  if(BENCH_ENABLE_EMBREE_CUDA)
+    set_target_properties(bench PROPERTIES CUDA_ARCHITECTURES ${BENCH_EMBREE_CUDA_ARCH})
+    target_compile_definitions(bench PUBLIC BENCH_EMBREE_CUDA)
+    target_link_libraries(bench PRIVATE CUDA::cudart)
   endif()
 
   target_compile_definitions(bench PRIVATE VK_NO_PROTOTYPES)
 
-  target_link_libraries(bench PRIVATE vk_radix_sort volk::volk_headers VulkanMemoryAllocator fuchsia_radix_sort)
+  target_link_libraries(bench PRIVATE vk_radix_sort volk::volk_headers VulkanMemoryAllocator)
 endif()

@@ -2433,7 +2433,7 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
 
 struct VrdxSorter_T {
   VkDevice device = VK_NULL_HANDLE;
-  PFN_vkCmdPushDescriptorSet cmdPushDescriptorSet = VK_NULL_HANDLE;
+  PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = VK_NULL_HANDLE;
 
   VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
@@ -2466,7 +2466,7 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
   VkDescriptorSetLayout descriptorSetLayout;
   VkDescriptorSetLayoutCreateInfo descriptorSetLayoutInfo = {
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  descriptorSetLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT;
+  descriptorSetLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
   descriptorSetLayoutInfo.bindingCount = bindingCount;
   descriptorSetLayoutInfo.pBindings = bindings;
   vkCreateDescriptorSetLayout(device, &descriptorSetLayoutInfo, NULL, &descriptorSetLayout);
@@ -2566,10 +2566,10 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
   vkGetPhysicalDeviceProperties(pCreateInfo->physicalDevice, &property);
 
 #ifdef VOLK_H_
-  auto cmdPushDescriptorSet = vkCmdPushDescriptorSet;
+  auto cmdPushDescriptorSet = vkCmdPushDescriptorSetKHR;
 #else
   auto cmdPushDescriptorSet =
-      (PFN_vkCmdPushDescriptorSet)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR");
+      (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR");
 #endif
 
   *pSorter = new VrdxSorter_T();
@@ -2669,7 +2669,7 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
                     uint32_t query) {
   VkDevice device = sorter->device;
   VkPipelineLayout pipelineLayout = sorter->pipelineLayout;
-  PFN_vkCmdPushDescriptorSet cmdPushDescriptorSet = sorter->cmdPushDescriptorSet;
+  PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = sorter->cmdPushDescriptorSet;
 
   uint32_t partitionCount = RoundUp(elementCount, PARTITION_SIZE);
 
