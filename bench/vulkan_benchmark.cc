@@ -247,6 +247,7 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
   Reallocate(&storage_, requirements.size, requirements.usage);
 
   std::memcpy(staging_.map, keys.data(), element_count * sizeof(uint32_t));
+  vmaFlushAllocation(allocator_, staging_.allocation, 0, inout_size);
 
   VkCommandBufferBeginInfo command_buffer_begin_info = {
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -255,7 +256,6 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
 
   vkCmdResetQueryPool(command_buffer_, query_pool_, 0, timestamp_count);
 
-  // copy to keys buffer
   VkBufferCopy region = {};
   region.srcOffset = 0;
   region.dstOffset = 0;
@@ -271,8 +271,14 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
   vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
   vkResetFences(device_, 1, &fence_);
 
-  // sort
   vkBeginCommandBuffer(command_buffer_, &command_buffer_begin_info);
+
+  VkMemoryBarrier sort_before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  sort_before.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  sort_before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &sort_before, 0, NULL, 0,
+                       NULL);
 
   vrdxCmdSort(command_buffer_, sorter_, element_count, keys_.buffer, 0, storage_.buffer, 0,
               query_pool_, 0);
@@ -284,8 +290,13 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
   auto cpu_end = std::chrono::steady_clock::now();
   vkResetFences(device_, 1, &fence_);
 
-  // copy back
   vkBeginCommandBuffer(command_buffer_, &command_buffer_begin_info);
+
+  VkMemoryBarrier sort_after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  sort_after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  sort_after.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &sort_after, 0, NULL, 0, NULL);
 
   region.srcOffset = 0;
   region.dstOffset = 0;
@@ -304,6 +315,7 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
 
   Results result;
   result.keys.resize(element_count);
+  vmaInvalidateAllocation(allocator_, staging_.allocation, 0, inout_size);
   std::memcpy(result.keys.data(), staging_.map, element_count * sizeof(uint32_t));
   result.total_time = timestamps[timestamp_count - 1] - timestamps[0];
   result.cpu_time = std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_end - cpu_start).count();
@@ -328,6 +340,7 @@ VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_
   std::memcpy(staging_.map, keys.data(), element_count * sizeof(uint32_t));
   std::memcpy(staging_.map + inout_size, values.data(), element_count * sizeof(uint32_t));
   std::memcpy(staging_.map + 2 * inout_size, &element_count, sizeof(uint32_t));
+  vmaFlushAllocation(allocator_, staging_.allocation, 0, 2 * inout_size + sizeof(uint32_t));
 
   VkCommandBufferBeginInfo command_buffer_begin_info = {
       VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -355,6 +368,13 @@ VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_
   // sort
   vkBeginCommandBuffer(command_buffer_, &command_buffer_begin_info);
 
+  VkMemoryBarrier sort_before = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  sort_before.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  sort_before.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+  vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
+                       &sort_before, 0, NULL, 0, NULL);
+
   vrdxCmdSortKeyValueIndirect(command_buffer_, sorter_, element_count, keys_.buffer, 2 * inout_size,
                               keys_.buffer, 0, keys_.buffer, inout_size, storage_.buffer, 0,
                               query_pool_, 0);
@@ -368,6 +388,12 @@ VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_
 
   // copy back
   vkBeginCommandBuffer(command_buffer_, &command_buffer_begin_info);
+
+  VkMemoryBarrier sort_after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  sort_after.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+  sort_after.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &sort_after, 0, NULL, 0, NULL);
 
   region.srcOffset = 0;
   region.dstOffset = 0;
@@ -387,6 +413,7 @@ VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_
   Results result;
   result.keys.resize(element_count);
   result.values.resize(element_count);
+  vmaInvalidateAllocation(allocator_, staging_.allocation, 0, 2 * inout_size);
   std::memcpy(result.keys.data(), staging_.map, element_count * sizeof(uint32_t));
   std::memcpy(result.values.data(), staging_.map + inout_size, element_count * sizeof(uint32_t));
   result.total_time = timestamps[timestamp_count - 1] - timestamps[0];

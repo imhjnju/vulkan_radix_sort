@@ -98,7 +98,7 @@ void vrdxCmdSortKeyValueIndirect(VkCommandBuffer commandBuffer, VrdxSorter sorte
 // @SHADER_DATA:downsweep_key_value_slang@
 
 constexpr uint32_t RADIX = 256;
-constexpr int WORKGROUP_SIZE = 512;
+constexpr int WORKGROUP_SIZE = 256;
 constexpr int PARTITION_DIVISION = 8;
 constexpr int PARTITION_SIZE = PARTITION_DIVISION * WORKGROUP_SIZE;
 
