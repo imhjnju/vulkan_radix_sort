@@ -1,0 +1,100 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+const uint RADIX = 256;
+const uint WORKGROUP_SIZE = 512;
+const uint PARTITION_DIVISION = 8;
+const uint PARTITION_SIZE = PARTITION_DIVISION * WORKGROUP_SIZE;
+const uint MAX_SUBGROUP_SIZE = 128;
+
+layout(local_size_x = WORKGROUP_SIZE) in;
+
+layout(push_constant) uniform PushConstants {
+    int pass;
+} pc;
+
+layout(set = 0, binding = 0, std430) readonly buffer ElementCounts {
+    uint elementCounts[];
+};
+
+layout(set = 0, binding = 1, std430) buffer GlobalHistogram {
+    uint globalHistogram[];
+};
+
+layout(set = 0, binding = 2, std430) buffer PartitionHistogram {
+    uint partitionHistogram[];
+};
+
+shared uint reduction;
+shared uint intermediate[MAX_SUBGROUP_SIZE];
+
+void main() {
+    uint elementCount = elementCounts[0];
+
+    uint laneIndex = gl_SubgroupInvocationID;
+    uint laneCount = gl_SubgroupSize;
+    uint waveIndex = gl_LocalInvocationIndex / laneCount;
+    uint waveCount = WORKGROUP_SIZE / laneCount;
+    uint index = waveIndex * laneCount + laneIndex;
+
+    uint radix = gl_WorkGroupID.x;
+    uint partitionCount = (elementCount + PARTITION_SIZE - 1) / PARTITION_SIZE;
+
+    if (index == 0) {
+        reduction = 0;
+    }
+    barrier();
+
+    for (uint i = 0; WORKGROUP_SIZE * i < partitionCount; ++i) {
+        uint partitionIndex = WORKGROUP_SIZE * i + index;
+        uint value = partitionIndex < partitionCount ? partitionHistogram[RADIX * partitionIndex + radix] : 0;
+        uint excl = subgroupExclusiveAdd(value) + reduction;
+        uint sum = subgroupAdd(value);
+
+        if (subgroupElect()) {
+            intermediate[waveIndex] = sum;
+        }
+        barrier();
+
+        if (index < waveCount) {
+            uint intermediateExcl = subgroupExclusiveAdd(intermediate[index]);
+            uint intermediateSum = subgroupAdd(intermediate[index]);
+            intermediate[index] = intermediateExcl;
+
+            if (index == 0) {
+                reduction += intermediateSum;
+            }
+        }
+        barrier();
+
+        if (partitionIndex < partitionCount) {
+            excl += intermediate[waveIndex];
+            partitionHistogram[RADIX * partitionIndex + radix] = excl;
+        }
+        barrier();
+    }
+
+    if (radix == 0) {
+        if (index < RADIX) {
+            uint value = globalHistogram[RADIX * uint(pc.pass) + index];
+            uint excl = subgroupExclusiveAdd(value);
+            uint sum = subgroupAdd(value);
+
+            if (subgroupElect()) {
+                intermediate[waveIndex] = sum;
+            }
+            barrier();
+
+            if (index < RADIX / laneCount) {
+                uint intermediateExcl = subgroupExclusiveAdd(intermediate[index]);
+                intermediate[index] = intermediateExcl;
+            }
+            barrier();
+
+            excl += intermediate[waveIndex];
+            globalHistogram[RADIX * uint(pc.pass) + index] = excl;
+        }
+    }
+}

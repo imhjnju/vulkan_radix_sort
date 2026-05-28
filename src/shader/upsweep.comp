@@ -1,0 +1,64 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+const uint RADIX = 256;
+const uint WORKGROUP_SIZE = 512;
+const uint PARTITION_DIVISION = 8;
+const uint PARTITION_SIZE = PARTITION_DIVISION * WORKGROUP_SIZE;
+
+layout(local_size_x = WORKGROUP_SIZE) in;
+
+layout(push_constant) uniform PushConstants {
+    int pass;
+} pc;
+
+layout(set = 0, binding = 0, std430) readonly buffer ElementCounts {
+    uint elementCounts[];
+};
+
+layout(set = 0, binding = 1, std430) buffer GlobalHistogram {
+    uint globalHistogram[];
+};
+
+layout(set = 0, binding = 2, std430) buffer PartitionHistogram {
+    uint partitionHistogram[];
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer Keys {
+    uint keys[];
+};
+
+shared uint localHistogram[RADIX];
+
+void main() {
+    uint elementCount = elementCounts[0];
+
+    uint index = gl_LocalInvocationID.x;
+    uint partitionIndex = gl_WorkGroupID.x;
+    uint partitionStart = partitionIndex * PARTITION_SIZE;
+
+    if (partitionStart >= elementCount) {
+        return;
+    }
+
+    if (index < RADIX) {
+        localHistogram[index] = 0;
+    }
+    barrier();
+
+    [[unroll]]
+    for (int i = 0; i < int(PARTITION_DIVISION); ++i) {
+        uint keyIndex = partitionStart + WORKGROUP_SIZE * uint(i) + index;
+        uint key = keyIndex < elementCount ? keys[keyIndex] : 0xffffffffu;
+        uint radix = bitfieldExtract(key, 8 * pc.pass, 8);
+        atomicAdd(localHistogram[radix], 1);
+    }
+    barrier();
+
+    if (index < RADIX) {
+        partitionHistogram[RADIX * partitionIndex + index] = localHistogram[index];
+        atomicAdd(globalHistogram[RADIX * uint(pc.pass) + index], localHistogram[index]);
+    }
+}

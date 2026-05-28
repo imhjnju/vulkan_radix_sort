@@ -10,9 +10,12 @@ include(FetchContent)
 option(BENCH_ENABLE_EMBREE_CUDA "Build Embree CUDA radix sort benchmark backend" OFF)
 set(BENCH_EMBREE_CUDA_ARCH "native" CACHE STRING "CUDA architecture for the Embree CUDA benchmark backend")
 
+# find slangc
+string(REPLACE glslangValidator slangc SLANGC_EXECUTABLE ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE})
+message(STATUS "slangc executable: ${SLANGC_EXECUTABLE}")
+
 # shaders
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/generated)
-message(STATUS "glslangValidator executable: ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}")
 
 # build_shader(SHADER OUTPUT DEFINE...)
 function(build_shader)
@@ -23,14 +26,14 @@ function(build_shader)
 
   add_custom_target(${OUTPUT}
     COMMAND
-      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/glslang_to_header.py
-      ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}
-      -V
-      --target-env spirv1.5
+      ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/slangc_to_header.py
+      -target spirv
+      -fvk-t-shift 0 0
+      -fvk-u-shift 0 0
       -o ${CMAKE_CURRENT_SOURCE_DIR}/src/generated/${OUTPUT}.h
       ${DEFINES}
       ${SHADER}
-    COMMENT "Compiling ${CMAKE_CURRENT_SOURCE_DIR}/src/generated/${OUTPUT}.h from ${SHADER}"
+    COMMENT "Compiling ${CMAKE_CURRENT_SOURCE_DIR}/src/generated/${OUTPUT}.h"
     VERBATIM
   )
 endfunction()
@@ -43,10 +46,10 @@ target_include_directories(vk_radix_sort INTERFACE
   $<INSTALL_INTERFACE:include>
 )
 
-build_shader(src/shader/upsweep.comp upsweep_slang)
-build_shader(src/shader/spine.comp spine_slang)
-build_shader(src/shader/downsweep.comp downsweep_slang)
-build_shader(src/shader/downsweep.comp downsweep_key_value_slang KEY_VALUE)
+build_shader(src/shader/upsweep.slang upsweep_slang)
+build_shader(src/shader/spine.slang spine_slang)
+build_shader(src/shader/downsweep.slang downsweep_slang)
+build_shader(src/shader/downsweep.slang downsweep_key_value_slang KEY_VALUE)
 
 add_custom_target(vk_radix_sort_header
   COMMAND
@@ -65,7 +68,8 @@ add_custom_target(vk_radix_sort_header
   VERBATIM
 )
 
-add_dependencies(vk_radix_sort vk_radix_sort_header)
+# Use the checked-in generated header when building benchmarks without slangc.
+# add_dependencies(vk_radix_sort vk_radix_sort_header)
 
 # bench
 if(PROJECT_IS_TOP_LEVEL)
@@ -102,7 +106,6 @@ if(PROJECT_IS_TOP_LEVEL)
   endif()
 
   add_executable(bench ${BENCH_SOURCES})
-  add_dependencies(bench vk_radix_sort_header)
 
   set_target_properties(bench PROPERTIES
     CXX_STANDARD 17
