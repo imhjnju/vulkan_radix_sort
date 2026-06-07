@@ -11,7 +11,6 @@ Easily integrates into any Vulkan project without additional dependencies, makin
 ## Requirements
 
 - `VulkanSDK >= 1.4.328.1` — download from https://vulkan.lunarg.com/
-  - `slangc` is included in VulkanSDK >= 1.3.296.0
   - Push descriptor requires VulkanSDK >= 1.4 (>= 1.4.328.1 for macOS)
 - `cmake >= 3.24`
 
@@ -33,7 +32,7 @@ $ ./build/bench <type> [output.csv]              # Linux
 ```
 
 - `type`: `cpu`, `vulkan`, `cuda`, `fuchsia`
-- Sweeps N from 2^18 to 2^25 (128 steps), 1 warmup + 10 timed runs each
+- Sweeps N from 2^18 to 2^25 (128 steps), 5 warmups + 10 timed runs each
 - Outputs median GPU and CPU throughput to CSV
 
 Plot results:
@@ -165,7 +164,11 @@ Copy `include/vk_radix_sort.h` into your project and include it directly.
 
 ## Development Guide
 
-After modifying shaders, run the cmake build. It runs `slangc`, generates `src/generated/*.h`, then regenerates `include/vk_radix_sort.h` from `src/vk_radix_sort.h.in` via `tools/generate_header.py`.
+After modifying shaders, run the cmake build. It runs `glslangValidator`, generates `src/generated/*.h`, then regenerates `include/vk_radix_sort.h` from `src/vk_radix_sort.h.in` via `tools/generate_header.py`.
+
+See [DOWNSWEEP_OPTIMIZATION.md](DOWNSWEEP_OPTIMIZATION.md) for the synchronization rules, five-round
+optimization findings, profiling controls, extreme-input stress tests, and cross-platform regression
+checklist.
 
 
 ## TODO
