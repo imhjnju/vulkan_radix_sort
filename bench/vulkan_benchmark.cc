@@ -1,14 +1,60 @@
 #include "vulkan_benchmark.h"
 
-#include <iostream>
-#include <cstring>
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
 
 namespace {
 
 uint32_t Align(uint32_t a, uint32_t b) { return (a + b - 1) / b * b; }
 
 constexpr auto timestamp_count = 15;
+constexpr uint64_t kDefaultFenceTimeoutMs = 30000;
+
+bool DetailedProfilingEnabled() { return std::getenv("VRDX_PROFILE") != nullptr; }
+
+uint64_t FenceTimeoutNs() {
+  const char* value = std::getenv("VRDX_FENCE_TIMEOUT_MS");
+  if (value == nullptr) return kDefaultFenceTimeoutMs * 1000000;
+
+  char* end = nullptr;
+  unsigned long long timeout_ms = std::strtoull(value, &end, 10);
+  if (end == value || *end != '\0' || timeout_ms == 0 ||
+      timeout_ms > std::numeric_limits<uint64_t>::max() / 1000000) {
+    throw std::runtime_error("VRDX_FENCE_TIMEOUT_MS must be a positive integer");
+  }
+  return static_cast<uint64_t>(timeout_ms) * 1000000;
+}
+
+void WaitForFence(VkDevice device, VkFence fence, const char* stage) {
+  VkResult result = vkWaitForFences(device, 1, &fence, VK_TRUE, FenceTimeoutNs());
+  if (result == VK_SUCCESS) return;
+  if (result == VK_TIMEOUT) {
+    throw std::runtime_error(std::string("Vulkan fence timeout during ") + stage);
+  }
+  throw std::runtime_error(std::string("vkWaitForFences failed during ") + stage +
+                           " with VkResult " + std::to_string(result));
+}
+
+void FillStageTimes(const std::vector<uint64_t>& timestamps, float timestamp_period,
+                    BenchmarkBase::Results* result) {
+  auto elapsed = [&](int begin, int end) {
+    return static_cast<uint64_t>((timestamps[end] - timestamps[begin]) * timestamp_period);
+  };
+
+  result->transfer_time = elapsed(0, 1);
+  for (int pass = 0; pass < 4; ++pass) {
+    int base = 1 + 3 * pass;
+    result->upsweep_time += elapsed(base, base + 1);
+    result->spine_time += elapsed(base + 1, base + 2);
+    result->downsweep_time += elapsed(base + 2, base + 3);
+  }
+  result->finalize_time = elapsed(13, 14);
+}
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL
 DebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
@@ -98,6 +144,9 @@ VulkanBenchmark::VulkanBenchmark() {
   std::vector<VkPhysicalDevice> physical_devices(physical_device_count);
   vkEnumeratePhysicalDevices(instance_, &physical_device_count, physical_devices.data());
   physical_device_ = physical_devices[0];
+  VkPhysicalDeviceProperties physical_device_properties = {};
+  vkGetPhysicalDeviceProperties(physical_device_, &physical_device_properties);
+  timestamp_period_ = physical_device_properties.limits.timestampPeriod;
 
   // find graphics queue
   uint32_t queue_family_count = 0;
@@ -125,14 +174,47 @@ VulkanBenchmark::VulkanBenchmark() {
   queue_infos[0].queueCount = queue_priorities.size();
   queue_infos[0].pQueuePriorities = queue_priorities.data();
 
+  uint32_t device_extension_count = 0;
+  vkEnumerateDeviceExtensionProperties(physical_device_, NULL, &device_extension_count, NULL);
+  std::vector<VkExtensionProperties> available_device_extensions(device_extension_count);
+  vkEnumerateDeviceExtensionProperties(physical_device_, NULL, &device_extension_count,
+                                       available_device_extensions.data());
+  auto has_device_extension = [&](const char* name) {
+    return std::any_of(available_device_extensions.begin(), available_device_extensions.end(),
+                       [&](const VkExtensionProperties& extension) {
+                         return std::strcmp(extension.extensionName, name) == 0;
+                       });
+  };
+
   std::vector<const char*> device_extensions = {
-      VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 #ifdef __APPLE__
       "VK_KHR_portability_subset",
 #endif
   };
+  if (has_device_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
+    device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+  }
+  if (has_device_extension(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+    device_extensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+  }
+
+  VkPhysicalDeviceSubgroupSizeControlFeatures subgroup_size_features = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+  VkPhysicalDeviceFeatures2 available_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+  available_features.pNext = &subgroup_size_features;
+  vkGetPhysicalDeviceFeatures2(physical_device_, &available_features);
+
+  VkPhysicalDeviceSubgroupSizeControlFeatures enabled_subgroup_size_features = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
+  enabled_subgroup_size_features.subgroupSizeControl =
+      subgroup_size_features.subgroupSizeControl;
+  enabled_subgroup_size_features.computeFullSubgroups =
+      subgroup_size_features.computeFullSubgroups;
 
   VkDeviceCreateInfo device_info = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+  if (enabled_subgroup_size_features.subgroupSizeControl) {
+    device_info.pNext = &enabled_subgroup_size_features;
+  }
   device_info.queueCreateInfoCount = queue_infos.size();
   device_info.pQueueCreateInfos = queue_infos.data();
   device_info.enabledExtensionCount = device_extensions.size();
@@ -183,6 +265,23 @@ VulkanBenchmark::VulkanBenchmark() {
   VrdxSorterCreateInfo sorter_info = {};
   sorter_info.physicalDevice = physical_device_;
   sorter_info.device = device_;
+
+  VkPhysicalDeviceSubgroupSizeControlProperties subgroup_size_properties = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+  VkPhysicalDeviceSubgroupProperties subgroup_properties = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+  VkPhysicalDeviceProperties2 properties = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  properties.pNext = &subgroup_properties;
+  subgroup_properties.pNext = &subgroup_size_properties;
+  vkGetPhysicalDeviceProperties2(physical_device_, &properties);
+  if (enabled_subgroup_size_features.subgroupSizeControl &&
+      subgroup_size_properties.minSubgroupSize <= 32 &&
+      subgroup_size_properties.maxSubgroupSize >= 32 &&
+      (subgroup_size_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
+    sorter_info.requiredSubgroupSize = 32;
+  } else if (subgroup_properties.subgroupSize < 32) {
+    throw std::runtime_error("vk_radix_sort requires a compute subgroup size of at least 32");
+  }
   vrdxCreateSorter(&sorter_info, &sorter_);
 }
 
@@ -234,7 +333,8 @@ void VulkanBenchmark::Reallocate(Buffer* buffer, VkDeviceSize size, VkBufferUsag
 
 VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys) {
   uint32_t element_count = keys.size();
-  uint32_t inout_size = Align(element_count * sizeof(uint32_t), 16);
+  uint32_t inout_size = std::max(Align(element_count * sizeof(uint32_t), 16), 16u);
+  bool detailed_profiling = DetailedProfilingEnabled();
 
   Reallocate(&staging_, inout_size,
              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
@@ -260,7 +360,7 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
   region.srcOffset = 0;
   region.dstOffset = 0;
   region.size = element_count * sizeof(uint32_t);
-  vkCmdCopyBuffer(command_buffer_, staging_.buffer, keys_.buffer, 1, &region);
+  if (region.size != 0) vkCmdCopyBuffer(command_buffer_, staging_.buffer, keys_.buffer, 1, &region);
 
   vkEndCommandBuffer(command_buffer_);
 
@@ -268,7 +368,7 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &command_buffer_;
   vkQueueSubmit(queue_, 1, &submit, fence_);
-  vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+  WaitForFence(device_, fence_, "key upload");
   vkResetFences(device_, 1, &fence_);
 
   vkBeginCommandBuffer(command_buffer_, &command_buffer_begin_info);
@@ -280,13 +380,19 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &sort_before, 0, NULL, 0,
                        NULL);
 
+  if (!detailed_profiling) {
+    vkCmdWriteTimestamp(command_buffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, query_pool_, 0);
+  }
   vrdxCmdSort(command_buffer_, sorter_, element_count, keys_.buffer, 0, storage_.buffer, 0,
-              query_pool_, 0);
+              detailed_profiling ? query_pool_ : VK_NULL_HANDLE, 0);
+  if (!detailed_profiling) {
+    vkCmdWriteTimestamp(command_buffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, query_pool_, 1);
+  }
 
   vkEndCommandBuffer(command_buffer_);
   auto cpu_start = std::chrono::steady_clock::now();
   vkQueueSubmit(queue_, 1, &submit, fence_);
-  vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+  WaitForFence(device_, fence_, "key sort");
   auto cpu_end = std::chrono::steady_clock::now();
   vkResetFences(device_, 1, &fence_);
 
@@ -301,14 +407,15 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
   region.srcOffset = 0;
   region.dstOffset = 0;
   region.size = element_count * sizeof(uint32_t);
-  vkCmdCopyBuffer(command_buffer_, keys_.buffer, staging_.buffer, 1, &region);
+  if (region.size != 0) vkCmdCopyBuffer(command_buffer_, keys_.buffer, staging_.buffer, 1, &region);
 
   vkEndCommandBuffer(command_buffer_);
   vkQueueSubmit(queue_, 1, &submit, fence_);
-  vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+  WaitForFence(device_, fence_, "key readback");
   vkResetFences(device_, 1, &fence_);
 
-  std::vector<uint64_t> timestamps(timestamp_count);
+  size_t result_count = detailed_profiling ? timestamp_count : 2;
+  std::vector<uint64_t> timestamps(result_count);
   vkGetQueryPoolResults(device_, query_pool_, 0, timestamps.size(),
                         timestamps.size() * sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
                         VK_QUERY_RESULT_64_BIT);
@@ -317,7 +424,9 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
   result.keys.resize(element_count);
   vmaInvalidateAllocation(allocator_, staging_.allocation, 0, inout_size);
   std::memcpy(result.keys.data(), staging_.map, element_count * sizeof(uint32_t));
-  result.total_time = timestamps[timestamp_count - 1] - timestamps[0];
+  result.total_time =
+      static_cast<uint64_t>((timestamps[result_count - 1] - timestamps[0]) * timestamp_period_);
+  if (detailed_profiling) FillStageTimes(timestamps, timestamp_period_, &result);
   result.cpu_time = std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_end - cpu_start).count();
   return result;
 }
@@ -325,7 +434,8 @@ VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys
 VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_t>& keys,
                                                        const std::vector<uint32_t>& values) {
   uint32_t element_count = keys.size();
-  uint32_t inout_size = Align(element_count * sizeof(uint32_t), 16);
+  uint32_t inout_size = std::max(Align(element_count * sizeof(uint32_t), 16), 16u);
+  bool detailed_profiling = DetailedProfilingEnabled();
 
   Reallocate(&staging_, 2 * inout_size + 16,
              VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
@@ -362,7 +472,7 @@ VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &command_buffer_;
   vkQueueSubmit(queue_, 1, &submit, fence_);
-  vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+  WaitForFence(device_, fence_, "key-value upload");
   vkResetFences(device_, 1, &fence_);
 
   // sort
@@ -375,14 +485,20 @@ VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_
                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
                        &sort_before, 0, NULL, 0, NULL);
 
+  if (!detailed_profiling) {
+    vkCmdWriteTimestamp(command_buffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, query_pool_, 0);
+  }
   vrdxCmdSortKeyValueIndirect(command_buffer_, sorter_, element_count, keys_.buffer, 2 * inout_size,
                               keys_.buffer, 0, keys_.buffer, inout_size, storage_.buffer, 0,
-                              query_pool_, 0);
+                              detailed_profiling ? query_pool_ : VK_NULL_HANDLE, 0);
+  if (!detailed_profiling) {
+    vkCmdWriteTimestamp(command_buffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, query_pool_, 1);
+  }
 
   vkEndCommandBuffer(command_buffer_);
   auto cpu_start = std::chrono::steady_clock::now();
   vkQueueSubmit(queue_, 1, &submit, fence_);
-  vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+  WaitForFence(device_, fence_, "key-value sort");
   auto cpu_end = std::chrono::steady_clock::now();
   vkResetFences(device_, 1, &fence_);
 
@@ -402,10 +518,11 @@ VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_
 
   vkEndCommandBuffer(command_buffer_);
   vkQueueSubmit(queue_, 1, &submit, fence_);
-  vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+  WaitForFence(device_, fence_, "key-value readback");
   vkResetFences(device_, 1, &fence_);
 
-  std::vector<uint64_t> timestamps(timestamp_count);
+  size_t result_count = detailed_profiling ? timestamp_count : 2;
+  std::vector<uint64_t> timestamps(result_count);
   vkGetQueryPoolResults(device_, query_pool_, 0, timestamps.size(),
                         timestamps.size() * sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
                         VK_QUERY_RESULT_64_BIT);
@@ -416,7 +533,9 @@ VulkanBenchmark::Results VulkanBenchmark::SortKeyValue(const std::vector<uint32_
   vmaInvalidateAllocation(allocator_, staging_.allocation, 0, 2 * inout_size);
   std::memcpy(result.keys.data(), staging_.map, element_count * sizeof(uint32_t));
   std::memcpy(result.values.data(), staging_.map + inout_size, element_count * sizeof(uint32_t));
-  result.total_time = timestamps[timestamp_count - 1] - timestamps[0];
+  result.total_time =
+      static_cast<uint64_t>((timestamps[result_count - 1] - timestamps[0]) * timestamp_period_);
+  if (detailed_profiling) FillStageTimes(timestamps, timestamp_period_, &result);
   result.cpu_time = std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_end - cpu_start).count();
   return result;
 }

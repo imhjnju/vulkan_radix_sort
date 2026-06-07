@@ -19,6 +19,7 @@ struct VrdxSorterCreateInfo {
   VkPhysicalDevice physicalDevice;
   VkDevice device;
   VkPipelineCache pipelineCache;
+  uint32_t requiredSubgroupSize;
 };
 
 void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSorter);
@@ -102,8 +103,10 @@ constexpr int WORKGROUP_SIZE = 256;
 constexpr int PARTITION_DIVISION = 8;
 constexpr int PARTITION_SIZE = PARTITION_DIVISION * WORKGROUP_SIZE;
 
-static uint32_t RoundUp(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
-static uint32_t Align(uint32_t a, uint32_t b) { return (a + b - 1) / b * b; }
+static uint32_t RoundUp(uint32_t a, uint32_t b) { return a / b + (a % b != 0); }
+static VkDeviceSize Align(VkDeviceSize a, VkDeviceSize b) {
+  return a / b * b + (a % b != 0 ? b : 0);
+}
 
 static VkDeviceSize HistogramSize(uint32_t elementCount, uint32_t align) {
   return Align((4 + 4 * RADIX + RoundUp(elementCount, PARTITION_SIZE) * RADIX) * sizeof(uint32_t),
@@ -111,7 +114,7 @@ static VkDeviceSize HistogramSize(uint32_t elementCount, uint32_t align) {
 }
 
 static VkDeviceSize InoutSize(uint32_t elementCount, uint32_t align) {
-  return Align(elementCount * sizeof(uint32_t), align);
+  return Align(VkDeviceSize(elementCount) * sizeof(uint32_t), align);
 }
 
 static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t elementCount,
@@ -123,8 +126,11 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
 struct VrdxSorter_T {
   VkDevice device = VK_NULL_HANDLE;
   PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = VK_NULL_HANDLE;
+  bool usePushDescriptors = false;
 
   VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+  VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+  VkDescriptorSet descriptorSets[4] = {};
   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
 
   VkPipeline upsweepPipeline = VK_NULL_HANDLE;
@@ -132,15 +138,29 @@ struct VrdxSorter_T {
   VkPipeline downsweepPipeline = VK_NULL_HANDLE;
   VkPipeline downsweepKeyValuePipeline = VK_NULL_HANDLE;
   VkDeviceSize minStorageBufferOffsetAlignment = 16;
+  uint32_t subgroupSize = 0;
 };
 
 struct PushConstants {
   uint32_t pass;
+  uint32_t maxElementCount;
 };
 
 void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSorter) {
   VkDevice device = pCreateInfo->device;
   VkPipelineCache pipelineCache = pCreateInfo->pipelineCache;
+
+#ifdef VOLK_H_
+  auto cmdPushDescriptorSet = vkCmdPushDescriptorSetKHR;
+#else
+  auto cmdPushDescriptorSet =
+      (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR");
+#endif
+  bool usePushDescriptors = cmdPushDescriptorSet != NULL;
+
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSizeInfo = {
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+  subgroupSizeInfo.requiredSubgroupSize = pCreateInfo->requiredSubgroupSize;
 
   // descriptor layout
   constexpr int bindingCount = 7;
@@ -155,7 +175,8 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
   VkDescriptorSetLayout descriptorSetLayout;
   VkDescriptorSetLayoutCreateInfo descriptorSetLayoutInfo = {
       VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  descriptorSetLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+  descriptorSetLayoutInfo.flags =
+      usePushDescriptors ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0;
   descriptorSetLayoutInfo.bindingCount = bindingCount;
   descriptorSetLayoutInfo.pBindings = bindings;
   vkCreateDescriptorSetLayout(device, &descriptorSetLayoutInfo, NULL, &descriptorSetLayout);
@@ -174,6 +195,29 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
   pipelineLayoutInfo.pPushConstantRanges = &pushConstants;
   vkCreatePipelineLayout(device, &pipelineLayoutInfo, NULL, &pipelineLayout);
 
+  VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+  VkDescriptorSet descriptorSets[4] = {};
+  if (!usePushDescriptors) {
+    VkDescriptorPoolSize poolSize = {};
+    poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    poolSize.descriptorCount = bindingCount * 4;
+
+    VkDescriptorPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    poolInfo.maxSets = 4;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+    vkCreateDescriptorPool(device, &poolInfo, NULL, &descriptorPool);
+
+    VkDescriptorSetLayout setLayouts[4] = {
+        descriptorSetLayout, descriptorSetLayout, descriptorSetLayout, descriptorSetLayout};
+    VkDescriptorSetAllocateInfo allocateInfo = {
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocateInfo.descriptorPool = descriptorPool;
+    allocateInfo.descriptorSetCount = 4;
+    allocateInfo.pSetLayouts = setLayouts;
+    vkAllocateDescriptorSets(device, &allocateInfo, descriptorSets);
+  }
+
   // pipelines
   VkPipeline upsweepPipeline;
   {
@@ -188,6 +232,10 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
     pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
+    if (pCreateInfo->requiredSubgroupSize) {
+      pipelineInfo.stage.pNext = &subgroupSizeInfo;
+      pipelineInfo.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
     pipelineInfo.layout = pipelineLayout;
 
     vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, NULL, &upsweepPipeline);
@@ -208,6 +256,10 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
     pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
+    if (pCreateInfo->requiredSubgroupSize) {
+      pipelineInfo.stage.pNext = &subgroupSizeInfo;
+      pipelineInfo.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
     pipelineInfo.layout = pipelineLayout;
 
     vkCreateComputePipelines(device, pipelineCache, 1, &pipelineInfo, NULL, &spinePipeline);
@@ -234,6 +286,10 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
     pipelineInfos[0].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfos[0].stage.module = shaderModules[0];
     pipelineInfos[0].stage.pName = "main";
+    if (pCreateInfo->requiredSubgroupSize) {
+      pipelineInfos[0].stage.pNext = &subgroupSizeInfo;
+      pipelineInfos[0].stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
     pipelineInfos[0].layout = pipelineLayout;
 
     pipelineInfos[1] = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -241,6 +297,10 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
     pipelineInfos[1].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfos[1].stage.module = shaderModules[1];
     pipelineInfos[1].stage.pName = "main";
+    if (pCreateInfo->requiredSubgroupSize) {
+      pipelineInfos[1].stage.pNext = &subgroupSizeInfo;
+      pipelineInfos[1].stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
     pipelineInfos[1].layout = pipelineLayout;
 
     VkPipeline pipelines[2];
@@ -253,19 +313,20 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
 
   auto property = VkPhysicalDeviceProperties{};
   vkGetPhysicalDeviceProperties(pCreateInfo->physicalDevice, &property);
-
-#ifdef VOLK_H_
-  auto cmdPushDescriptorSet = vkCmdPushDescriptorSetKHR;
-#else
-  auto cmdPushDescriptorSet =
-      (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR");
-#endif
+  VkPhysicalDeviceSubgroupProperties subgroupProperties = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+  VkPhysicalDeviceProperties2 properties2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  properties2.pNext = &subgroupProperties;
+  vkGetPhysicalDeviceProperties2(pCreateInfo->physicalDevice, &properties2);
 
   *pSorter = new VrdxSorter_T();
   (*pSorter)->device = device;
   (*pSorter)->cmdPushDescriptorSet = cmdPushDescriptorSet;
+  (*pSorter)->usePushDescriptors = usePushDescriptors;
 
   (*pSorter)->descriptorSetLayout = descriptorSetLayout;
+  (*pSorter)->descriptorPool = descriptorPool;
+  for (int i = 0; i < 4; ++i) (*pSorter)->descriptorSets[i] = descriptorSets[i];
   (*pSorter)->pipelineLayout = pipelineLayout;
 
   (*pSorter)->upsweepPipeline = upsweepPipeline;
@@ -273,6 +334,9 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
   (*pSorter)->downsweepPipeline = downsweepPipeline;
   (*pSorter)->downsweepKeyValuePipeline = downsweepKeyValuePipeline;
   (*pSorter)->minStorageBufferOffsetAlignment = property.limits.minStorageBufferOffsetAlignment;
+  (*pSorter)->subgroupSize =
+      pCreateInfo->requiredSubgroupSize ? pCreateInfo->requiredSubgroupSize
+                                       : subgroupProperties.subgroupSize;
 }
 
 void vrdxDestroySorter(VrdxSorter sorter) {
@@ -281,6 +345,7 @@ void vrdxDestroySorter(VrdxSorter sorter) {
   vkDestroyPipeline(sorter->device, sorter->downsweepPipeline, NULL);
   vkDestroyPipeline(sorter->device, sorter->downsweepKeyValuePipeline, NULL);
 
+  vkDestroyDescriptorPool(sorter->device, sorter->descriptorPool, NULL);
   vkDestroyPipelineLayout(sorter->device, sorter->pipelineLayout, NULL);
   vkDestroyDescriptorSetLayout(sorter->device, sorter->descriptorSetLayout, NULL);
   delete sorter;
@@ -356,16 +421,23 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
                     VkDeviceSize keysOffset, VkBuffer valuesBuffer, VkDeviceSize valuesOffset,
                     VkBuffer storageBuffer, VkDeviceSize storageOffset, VkQueryPool queryPool,
                     uint32_t query) {
+  if (elementCount == 0) {
+    if (queryPool) {
+      for (uint32_t i = 0; i < 15; ++i) {
+        vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queryPool, query + i);
+      }
+    }
+    return;
+  }
+
   VkDevice device = sorter->device;
   VkPipelineLayout pipelineLayout = sorter->pipelineLayout;
-  PFN_vkCmdPushDescriptorSetKHR cmdPushDescriptorSet = sorter->cmdPushDescriptorSet;
-
   uint32_t partitionCount = RoundUp(elementCount, PARTITION_SIZE);
 
   auto align = sorter->minStorageBufferOffsetAlignment;
   VkDeviceSize elementCountSize = Align(sizeof(uint32_t), align);
   VkDeviceSize histogramSize = HistogramSize(elementCount, align);
-  VkDeviceSize inoutSize = Align(elementCount * sizeof(uint32_t), align);
+  VkDeviceSize inoutSize = InoutSize(elementCount, align);
 
   VkDeviceSize elementCountOffset = storageOffset;
   VkDeviceSize histogramOffset = elementCountOffset + elementCountSize;
@@ -391,11 +463,16 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
   // reset global histogram. partition histogram is set by shader.
   vkCmdFillBuffer(commandBuffer, storageBuffer, histogramOffset, 4 * RADIX * sizeof(uint32_t), 0);
 
-  VkMemoryBarrier memoryBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-  memoryBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-  memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  VkBufferMemoryBarrier bufferBarrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  bufferBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  bufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  bufferBarrier.buffer = storageBuffer;
+  bufferBarrier.offset = storageOffset;
+  bufferBarrier.size = VK_WHOLE_SIZE;
   vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memoryBarrier, 0, NULL, 0,
+                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &bufferBarrier, 0,
                        NULL);
 
   if (queryPool) {
@@ -403,8 +480,9 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
   }
 
   PushConstants pushConstants;
-  for (int i = 0; i < 4; ++i) {
-    pushConstants.pass = i;
+  pushConstants.maxElementCount = elementCount;
+  for (int pass = 0; pass < 4; ++pass) {
+    pushConstants.pass = pass;
 
     int writeCount = 5;
     VkDescriptorBufferInfo buffers[7];
@@ -421,7 +499,7 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
     }
 
     // switch in->out to out->in for pass 1, pass 3
-    if (i % 2 == 1) {
+    if (pass % 2 == 1) {
       VkDescriptorBufferInfo tmp = buffers[3];
       buffers[3] = buffers[4];
       buffers[4] = tmp;
@@ -435,15 +513,22 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
     VkWriteDescriptorSet writes[7];
     for (int i = 0; i < writeCount; ++i) {
       writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-      writes[i].dstSet = 0;
+      writes[i].dstSet =
+          sorter->usePushDescriptors ? VK_NULL_HANDLE : sorter->descriptorSets[pass];
       writes[i].dstBinding = i;
       writes[i].descriptorCount = 1;
       writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
       writes[i].pBufferInfo = &buffers[i];
     }
 
-    cmdPushDescriptorSet(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
-                         writeCount, writes);
+    if (sorter->usePushDescriptors) {
+      sorter->cmdPushDescriptorSet(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0,
+                                   writeCount, writes);
+    } else {
+      vkUpdateDescriptorSets(device, writeCount, writes, 0, NULL);
+      vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, 1,
+                              &sorter->descriptorSets[pass], 0, NULL);
+    }
 
     vkCmdPushConstants(commandBuffer, sorter->pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof(pushConstants), &pushConstants);
@@ -455,32 +540,43 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
 
     if (queryPool) {
       vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool,
-                          query + 2 + 3 * i + 0);
+                          query + 2 + 3 * pass + 0);
     }
 
     // spine
-    memoryBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bufferBarrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bufferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bufferBarrier.buffer = storageBuffer;
+    bufferBarrier.offset = histogramOffset;
+    bufferBarrier.size = histogramSize;
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memoryBarrier, 0, NULL, 0,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &bufferBarrier, 0,
                          NULL);
 
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, sorter->spinePipeline);
 
-    vkCmdDispatch(commandBuffer, RADIX, 1, 1);
+    vkCmdDispatch(commandBuffer,
+                  RoundUp(RADIX, WORKGROUP_SIZE / sorter->subgroupSize), 1, 1);
 
     if (queryPool) {
       vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool,
-                          query + 2 + 3 * i + 1);
+                          query + 2 + 3 * pass + 1);
     }
 
     // downsweep
-    memoryBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bufferBarrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+    bufferBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    bufferBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    bufferBarrier.buffer = storageBuffer;
+    bufferBarrier.offset = histogramOffset;
+    bufferBarrier.size = histogramSize;
     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memoryBarrier, 0, NULL, 0,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, 1, &bufferBarrier, 0,
                          NULL);
 
     if (valuesBuffer) {
@@ -494,16 +590,39 @@ static void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t e
 
     if (queryPool) {
       vkCmdWriteTimestamp(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, queryPool,
-                          query + 2 + 3 * i + 2);
+                          query + 2 + 3 * pass + 2);
     }
 
-    if (i < 3) {
-      memoryBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-      memoryBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-      memoryBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    if (pass < 3) {
+      VkBufferMemoryBarrier passBarriers[3] = {};
+      uint32_t passBarrierCount = 0;
+
+      passBarriers[passBarrierCount] = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+      passBarriers[passBarrierCount].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      passBarriers[passBarrierCount].dstAccessMask =
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      passBarriers[passBarrierCount].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      passBarriers[passBarrierCount].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      passBarriers[passBarrierCount].buffer = storageBuffer;
+      passBarriers[passBarrierCount].offset = storageOffset;
+      passBarriers[passBarrierCount].size = VK_WHOLE_SIZE;
+      ++passBarrierCount;
+
+      passBarriers[passBarrierCount] = passBarriers[0];
+      passBarriers[passBarrierCount].buffer = keysBuffer;
+      passBarriers[passBarrierCount].offset = 0;
+      ++passBarrierCount;
+
+      if (valuesBuffer && valuesBuffer != keysBuffer) {
+        passBarriers[passBarrierCount] = passBarriers[0];
+        passBarriers[passBarrierCount].buffer = valuesBuffer;
+        passBarriers[passBarrierCount].offset = 0;
+        ++passBarrierCount;
+      }
+
       vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memoryBarrier, 0, NULL, 0,
-                           NULL);
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, NULL, passBarrierCount,
+                           passBarriers, 0, NULL);
     }
   }
 

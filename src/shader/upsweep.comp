@@ -12,6 +12,7 @@ layout(local_size_x = WORKGROUP_SIZE) in;
 
 layout(push_constant) uniform PushConstants {
     int pass;
+    uint maxElementCount;
 } pc;
 
 layout(set = 0, binding = 0, std430) readonly buffer ElementCounts {
@@ -33,32 +34,31 @@ layout(set = 0, binding = 3, std430) readonly buffer Keys {
 shared uint localHistogram[RADIX];
 
 void main() {
-    uint elementCount = elementCounts[0];
+    uint elementCount = min(elementCounts[0], pc.maxElementCount);
 
     uint index = gl_LocalInvocationID.x;
     uint partitionIndex = gl_WorkGroupID.x;
     uint partitionStart = partitionIndex * PARTITION_SIZE;
 
-    if (partitionStart >= elementCount) {
-        return;
-    }
+    // This condition is uniform across the workgroup, keeping every barrier converged.
+    if (partitionStart < elementCount) {
+        for (uint i = index; i < RADIX; i += WORKGROUP_SIZE) {
+            localHistogram[i] = 0;
+        }
+        barrier();
 
-    if (index < RADIX) {
-        localHistogram[index] = 0;
-    }
-    barrier();
+        [[unroll]]
+        for (int i = 0; i < int(PARTITION_DIVISION); ++i) {
+            uint keyIndex = partitionStart + WORKGROUP_SIZE * uint(i) + index;
+            uint key = keyIndex < elementCount ? keys[keyIndex] : 0xffffffffu;
+            uint radix = bitfieldExtract(key, 8 * pc.pass, 8);
+            atomicAdd(localHistogram[radix], 1);
+        }
+        barrier();
 
-    [[unroll]]
-    for (int i = 0; i < int(PARTITION_DIVISION); ++i) {
-        uint keyIndex = partitionStart + WORKGROUP_SIZE * uint(i) + index;
-        uint key = keyIndex < elementCount ? keys[keyIndex] : 0xffffffffu;
-        uint radix = bitfieldExtract(key, 8 * pc.pass, 8);
-        atomicAdd(localHistogram[radix], 1);
-    }
-    barrier();
-
-    if (index < RADIX) {
-        partitionHistogram[RADIX * partitionIndex + index] = localHistogram[index];
-        atomicAdd(globalHistogram[RADIX * uint(pc.pass) + index], localHistogram[index]);
+        for (uint i = index; i < RADIX; i += WORKGROUP_SIZE) {
+            partitionHistogram[RADIX * partitionIndex + i] = localHistogram[i];
+            atomicAdd(globalHistogram[RADIX * uint(pc.pass) + i], localHistogram[i]);
+        }
     }
 }

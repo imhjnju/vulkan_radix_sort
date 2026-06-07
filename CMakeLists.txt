@@ -20,12 +20,17 @@ function(build_shader)
   list(TRANSFORM ARGV PREPEND "-D" OUTPUT_VARIABLE DEFINES)
 
   get_filename_component(SHADER ${SHADER} ABSOLUTE)
+  set(OPTIMIZATION_ARGS -Os)
+  if(OUTPUT STREQUAL "downsweep_key_value_slang")
+    set(OPTIMIZATION_ARGS)
+  endif()
 
   add_custom_target(${OUTPUT}
     COMMAND
       ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/glslang_to_header.py
       ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}
       -V
+      ${OPTIMIZATION_ARGS}
       --target-env spirv1.5
       -o ${CMAKE_CURRENT_SOURCE_DIR}/src/generated/${OUTPUT}.h
       ${DEFINES}

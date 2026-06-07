@@ -12,6 +12,7 @@ layout(local_size_x = WORKGROUP_SIZE) in;
 
 layout(push_constant) uniform PushConstants {
     int pass;
+    uint maxElementCount;
 } pc;
 
 layout(set = 0, binding = 0, std430) readonly buffer ElementCounts {
@@ -46,6 +47,7 @@ layout(set = 0, binding = 6, std430) buffer ValuesOut {
 
 shared uint localHistogram[PARTITION_SIZE];
 shared uint localHistogramSum[RADIX];
+shared uint subgroupSums[8];
 
 uvec4 getExclusiveWaveMask(uint laneIndex) {
     uvec4 mask = uvec4(0);
@@ -66,77 +68,8 @@ uint getBitCount(uvec4 value) {
     return result.x + result.y + result.z + result.w;
 }
 
-#ifdef KEY_VALUE
-#define APPLY_RADIX_BIT(BIT) { \
-    uint digit = (radix >> uint(BIT)) & 1u; \
-    uvec4 ballot = subgroupBallot(digit == 1u); \
-    mask &= uvec4(digit - 1u) ^ ballot; \
-}
-
-#define LOAD_PARTITION_ITEM(SLOT) { \
-    uint keyIndex = partitionStart + (PARTITION_DIVISION * laneCount) * waveIndex + uint(SLOT) * laneCount + laneIndex; \
-    uint key = keyIndex < elementCount ? keysIn[keyIndex] : 0xffffffffu; \
-    localKeys[SLOT] = key; \
-    localValues[SLOT] = keyIndex < elementCount ? valuesIn[keyIndex] : 0; \
-    uint radix = bitfieldExtract(key, pc.pass * 8, 8); \
-    localRadix[SLOT] = radix; \
-    uvec4 mask = subgroupBallot(true); \
-    APPLY_RADIX_BIT(0); \
-    APPLY_RADIX_BIT(1); \
-    APPLY_RADIX_BIT(2); \
-    APPLY_RADIX_BIT(3); \
-    APPLY_RADIX_BIT(4); \
-    APPLY_RADIX_BIT(5); \
-    APPLY_RADIX_BIT(6); \
-    APPLY_RADIX_BIT(7); \
-    uint waveOffset = getBitCount(waveMask & mask); \
-    uint radixCount = getBitCount(mask); \
-    if (waveOffset == 0) { \
-        atomicAdd(localHistogram[waveCount * radix + waveIndex], radixCount); \
-        waveHistogram[SLOT] = radixCount; \
-    } else { \
-        waveHistogram[SLOT] = 0; \
-    } \
-    localOffsets[SLOT] = waveOffset; \
-}
-
-#define POST_SCAN_ITEM(SLOT) { \
-    uint radix = localRadix[SLOT]; \
-    localOffsets[SLOT] += localHistogram[waveCount * radix + waveIndex]; \
-    barrier(); \
-    if (waveHistogram[SLOT] > 0) { \
-        atomicAdd(localHistogram[waveCount * radix + waveIndex], waveHistogram[SLOT]); \
-    } \
-    barrier(); \
-}
-
-#define STORE_KEY_ITEM(SLOT) localHistogram[localOffsets[SLOT]] = localKeys[SLOT]
-
-#define BIN_KEY_SLOT(SLOT) { \
-    uint i = index + WORKGROUP_SIZE * uint(SLOT); \
-    uint key = localHistogram[i]; \
-    uint radix = bitfieldExtract(key, pc.pass * 8, 8); \
-    uint dstOffset = localHistogramSum[radix] + i; \
-    if (dstOffset < elementCount) { \
-        keysOut[dstOffset] = key; \
-    } \
-    localKeys[SLOT] = dstOffset; \
-}
-
-#define STORE_VALUE_ITEM(SLOT) localHistogram[localOffsets[SLOT]] = localValues[SLOT]
-
-#define BIN_VALUE_SLOT(SLOT) { \
-    uint i = index + WORKGROUP_SIZE * uint(SLOT); \
-    uint value = localHistogram[i]; \
-    uint dstOffset = localKeys[SLOT]; \
-    if (dstOffset < elementCount) { \
-        valuesOut[dstOffset] = value; \
-    } \
-}
-#endif
-
 void main() {
-    uint elementCount = elementCounts[0];
+    uint elementCount = min(elementCounts[0], pc.maxElementCount);
 
     uint laneIndex = gl_SubgroupInvocationID;
     uint laneCount = gl_SubgroupSize;
@@ -149,191 +82,137 @@ void main() {
     uint partitionIndex = gl_WorkGroupID.x;
     uint partitionStart = partitionIndex * PARTITION_SIZE;
 
-    if (partitionStart >= elementCount) {
-        return;
-    }
-
-    if (index < RADIX) {
-        for (int i = 0; i < int(waveCount); ++i) {
-            localHistogram[waveCount * index + uint(i)] = 0;
-        }
-    }
-    barrier();
-
-    uint localKeys[PARTITION_DIVISION];
-    uint localRadix[PARTITION_DIVISION];
-    uint localOffsets[PARTITION_DIVISION];
-    uint waveHistogram[PARTITION_DIVISION];
-#ifdef KEY_VALUE
-    uint localValues[PARTITION_DIVISION];
-#endif
-
-#ifdef KEY_VALUE
-    LOAD_PARTITION_ITEM(0);
-    LOAD_PARTITION_ITEM(1);
-    LOAD_PARTITION_ITEM(2);
-    LOAD_PARTITION_ITEM(3);
-    LOAD_PARTITION_ITEM(4);
-    LOAD_PARTITION_ITEM(5);
-    LOAD_PARTITION_ITEM(6);
-    LOAD_PARTITION_ITEM(7);
-#else
-    for (int i = 0; i < int(PARTITION_DIVISION); ++i) {
-        uint keyIndex = partitionStart + (PARTITION_DIVISION * laneCount) * waveIndex + uint(i) * laneCount + laneIndex;
-        uint key = keyIndex < elementCount ? keysIn[keyIndex] : 0xffffffffu;
-        localKeys[i] = key;
-
-        uint radix = bitfieldExtract(key, pc.pass * 8, 8);
-        localRadix[i] = radix;
-
-        uvec4 mask = subgroupBallot(true);
-        for (int j = 0; j < 8; ++j) {
-            uint digit = (radix >> uint(j)) & 1u;
-            uvec4 ballot = subgroupBallot(digit == 1u);
-            mask &= uvec4(digit - 1u) ^ ballot;
-        }
-
-        uint waveOffset = getBitCount(waveMask & mask);
-        uint radixCount = getBitCount(mask);
-
-        if (waveOffset == 0) {
-            atomicAdd(localHistogram[waveCount * radix + waveIndex], radixCount);
-            waveHistogram[i] = radixCount;
-        } else {
-            waveHistogram[i] = 0;
-        }
-
-        localOffsets[i] = waveOffset;
-    }
-#endif
-    barrier();
-
-    for (uint i = index; i < RADIX * waveCount; i += WORKGROUP_SIZE) {
-        uint value = localHistogram[i];
-        uint sum = subgroupAdd(value);
-        uint excl = subgroupExclusiveAdd(value);
-        localHistogram[i] = excl;
-        if (laneIndex == 0) {
-            localHistogramSum[i / laneCount] = sum;
-        }
-    }
-    barrier();
-
-    uint intermediateOffset0 = RADIX * waveCount / laneCount;
-    if (index < intermediateOffset0) {
-        uint value = localHistogramSum[index];
-        uint sum = subgroupAdd(value);
-        uint excl = subgroupExclusiveAdd(value);
-        localHistogramSum[index] = excl;
-        if (laneIndex == 0) {
-            localHistogramSum[intermediateOffset0 + index / laneCount] = sum;
-        }
-    }
-    barrier();
-
-    uint intermediateSize1 = max(RADIX * waveCount / laneCount / laneCount, 1);
-    if (index < intermediateSize1) {
-        uint value = localHistogramSum[intermediateOffset0 + index];
-        uint excl = subgroupExclusiveAdd(value);
-        localHistogramSum[intermediateOffset0 + index] = excl;
-    }
-    barrier();
-
-    if (index < intermediateOffset0) {
-        localHistogramSum[index] += localHistogramSum[intermediateOffset0 + index / laneCount];
-    }
-    barrier();
-
-    for (uint i = index; i < RADIX * waveCount; i += WORKGROUP_SIZE) {
-        localHistogram[i] += localHistogramSum[i / laneCount];
-    }
-    barrier();
-
-#ifdef KEY_VALUE
-    POST_SCAN_ITEM(0);
-    POST_SCAN_ITEM(1);
-    POST_SCAN_ITEM(2);
-    POST_SCAN_ITEM(3);
-    POST_SCAN_ITEM(4);
-    POST_SCAN_ITEM(5);
-    POST_SCAN_ITEM(6);
-    POST_SCAN_ITEM(7);
-#else
-    for (int i = 0; i < int(PARTITION_DIVISION); ++i) {
-        uint radix = localRadix[i];
-        localOffsets[i] += localHistogram[waveCount * radix + waveIndex];
-
-        barrier();
-        if (waveHistogram[i] > 0) {
-            atomicAdd(localHistogram[waveCount * radix + waveIndex], waveHistogram[i]);
+    // This condition is uniform across the workgroup, keeping every barrier converged.
+    if (partitionStart < elementCount) {
+        for (uint i = index; i < RADIX * waveCount; i += WORKGROUP_SIZE) {
+            localHistogram[i] = 0;
         }
         barrier();
-    }
+
+        uint localKeys[PARTITION_DIVISION];
+        uint localRadix[PARTITION_DIVISION];
+        uint localOffsets[PARTITION_DIVISION];
+        uint waveHistogram[PARTITION_DIVISION];
+#ifdef KEY_VALUE
+        uint localValues[PARTITION_DIVISION];
 #endif
 
-    if (index < RADIX) {
-        uint value = index == 0 ? 0 : localHistogram[waveCount * index - 1];
-        localHistogramSum[index] = globalHistogram[RADIX * uint(pc.pass) + index] +
-                                   partitionHistogram[RADIX * partitionIndex + index] - value;
-    }
-    barrier();
-
+        for (uint i = 0; i < PARTITION_DIVISION; ++i) {
+            uint keyIndex = partitionStart + (PARTITION_DIVISION * laneCount) * waveIndex +
+                            i * laneCount + laneIndex;
+            uint key = keyIndex < elementCount ? keysIn[keyIndex] : 0xffffffffu;
+            localKeys[i] = key;
 #ifdef KEY_VALUE
-    STORE_KEY_ITEM(0);
-    STORE_KEY_ITEM(1);
-    STORE_KEY_ITEM(2);
-    STORE_KEY_ITEM(3);
-    STORE_KEY_ITEM(4);
-    STORE_KEY_ITEM(5);
-    STORE_KEY_ITEM(6);
-    STORE_KEY_ITEM(7);
-#else
-    for (int i = 0; i < int(PARTITION_DIVISION); ++i) {
-        localHistogram[localOffsets[i]] = localKeys[i];
-    }
+            localValues[i] = keyIndex < elementCount ? valuesIn[keyIndex] : 0;
 #endif
-    barrier();
 
-#ifdef KEY_VALUE
-    BIN_KEY_SLOT(0);
-    BIN_KEY_SLOT(1);
-    BIN_KEY_SLOT(2);
-    BIN_KEY_SLOT(3);
-    BIN_KEY_SLOT(4);
-    BIN_KEY_SLOT(5);
-    BIN_KEY_SLOT(6);
-    BIN_KEY_SLOT(7);
-#else
-    for (uint i = index; i < PARTITION_SIZE; i += WORKGROUP_SIZE) {
-        uint key = localHistogram[i];
-        uint radix = bitfieldExtract(key, pc.pass * 8, 8);
-        uint dstOffset = localHistogramSum[radix] + i;
-        if (dstOffset < elementCount) {
-            keysOut[dstOffset] = key;
+            uint radix = bitfieldExtract(key, pc.pass * 8, 8);
+            localRadix[i] = radix;
+
+            uvec4 mask = subgroupBallot(true);
+            for (uint bit = 0; bit < 8; ++bit) {
+                uint digit = (radix >> bit) & 1u;
+                uvec4 ballot = subgroupBallot(digit == 1u);
+                mask &= uvec4(digit - 1u) ^ ballot;
+            }
+
+            uint waveOffset = getBitCount(waveMask & mask);
+            uint radixCount = getBitCount(mask);
+            if (waveOffset == 0) {
+                atomicAdd(localHistogram[waveIndex * RADIX + radix], radixCount);
+                waveHistogram[i] = radixCount;
+            } else {
+                waveHistogram[i] = 0;
+            }
+            localOffsets[i] = waveOffset;
         }
-    }
-#endif
+        barrier();
+
+        uint radixTotal = 0;
+        for (uint wave = 0; wave < waveCount; ++wave) {
+            uint histogramIndex = wave * RADIX + index;
+            uint count = localHistogram[histogramIndex];
+            localHistogram[histogramIndex] = radixTotal;
+            radixTotal += count;
+        }
+
+        uint subgroupCount = subgroupAdd(radixTotal);
+        localHistogramSum[index] = subgroupExclusiveAdd(radixTotal);
+        if (laneIndex == 0) {
+            subgroupSums[waveIndex] = subgroupCount;
+        }
+        barrier();
+
+        uint subgroupPrefix = 0;
+        for (uint subgroup = 0; subgroup < waveIndex; ++subgroup) {
+            subgroupPrefix += subgroupSums[subgroup];
+        }
+        localHistogramSum[index] += subgroupPrefix;
+        barrier();
+
+        for (uint i = 0; i < PARTITION_DIVISION; ++i) {
+            uint radix = localRadix[i];
+            localOffsets[i] += localHistogramSum[radix] +
+                               localHistogram[waveIndex * RADIX + radix];
+            subgroupBarrier();
+            if (waveHistogram[i] > 0) {
+                atomicAdd(localHistogram[waveIndex * RADIX + radix], waveHistogram[i]);
+            }
+            subgroupBarrier();
+        }
+        barrier();
+
+        for (uint i = index; i < RADIX; i += WORKGROUP_SIZE) {
+            localHistogramSum[i] = globalHistogram[RADIX * uint(pc.pass) + i] +
+                                   partitionHistogram[RADIX * partitionIndex + i] -
+                                   localHistogramSum[i];
+        }
+        barrier();
 
 #ifdef KEY_VALUE
-    barrier();
+        for (uint i = 0; i < PARTITION_DIVISION; ++i) {
+            localHistogram[localOffsets[i]] = localKeys[i];
+        }
+        barrier();
 
-    STORE_VALUE_ITEM(0);
-    STORE_VALUE_ITEM(1);
-    STORE_VALUE_ITEM(2);
-    STORE_VALUE_ITEM(3);
-    STORE_VALUE_ITEM(4);
-    STORE_VALUE_ITEM(5);
-    STORE_VALUE_ITEM(6);
-    STORE_VALUE_ITEM(7);
-    barrier();
+        for (uint i = index; i < PARTITION_SIZE; i += WORKGROUP_SIZE) {
+            uint key = localHistogram[i];
+            uint radix = bitfieldExtract(key, pc.pass * 8, 8);
+            uint dstOffset = localHistogramSum[radix] + i;
+            if (dstOffset < elementCount) {
+                keysOut[dstOffset] = key;
+            }
+            localKeys[i / WORKGROUP_SIZE] = dstOffset;
+        }
 
-    BIN_VALUE_SLOT(0);
-    BIN_VALUE_SLOT(1);
-    BIN_VALUE_SLOT(2);
-    BIN_VALUE_SLOT(3);
-    BIN_VALUE_SLOT(4);
-    BIN_VALUE_SLOT(5);
-    BIN_VALUE_SLOT(6);
-    BIN_VALUE_SLOT(7);
+        barrier();
+
+        for (uint i = 0; i < PARTITION_DIVISION; ++i) {
+            localHistogram[localOffsets[i]] = localValues[i];
+        }
+        barrier();
+
+        for (uint i = index; i < PARTITION_SIZE; i += WORKGROUP_SIZE) {
+            uint value = localHistogram[i];
+            uint dstOffset = localKeys[i / WORKGROUP_SIZE];
+            if (dstOffset < elementCount) {
+                valuesOut[dstOffset] = value;
+            }
+        }
+#else
+        for (uint i = 0; i < PARTITION_DIVISION; ++i) {
+            localHistogram[localOffsets[i]] = localKeys[i];
+        }
+        barrier();
+
+        for (uint i = index; i < PARTITION_SIZE; i += WORKGROUP_SIZE) {
+            uint key = localHistogram[i];
+            uint radix = bitfieldExtract(key, pc.pass * 8, 8);
+            uint dstOffset = localHistogramSum[radix] + i;
+            if (dstOffset < elementCount) {
+                keysOut[dstOffset] = key;
+            }
+        }
 #endif
+    }
 }

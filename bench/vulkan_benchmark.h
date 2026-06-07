@@ -42,6 +42,7 @@ class VulkanBenchmark : public BenchmarkBase {
   VkCommandBuffer command_buffer_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;
   VkQueryPool query_pool_ = VK_NULL_HANDLE;
+  float timestamp_period_ = 1.0f;
 
   VrdxSorter sorter_ = VK_NULL_HANDLE;
   Buffer keys_;
