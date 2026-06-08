@@ -253,6 +253,29 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  if (const char* submissionStressRuns = std::getenv("VRDX_SUBMISSION_STRESS_RUNS")) {
+    try {
+      uint32_t runs = parseU32(submissionStressRuns);
+      uint32_t batch_size = 8;
+      if (const char* value = std::getenv("VRDX_SUBMISSION_STRESS_BATCH")) {
+        batch_size = parseU32(value);
+      }
+      if (runs == 0 || batch_size == 0) {
+        std::cerr << "Submission stress runs and batch size must be positive" << std::endl;
+        return 1;
+      }
+      if (!bench->RunSubmissionStress(runs, batch_size)) {
+        std::cerr << "Submission stress failed or is unavailable for backend: " << type
+                  << std::endl;
+        return 1;
+      }
+      return 0;
+    } catch (const std::exception& e) {
+      std::cerr << "Submission stress failed: " << e.what() << std::endl;
+      return 1;
+    }
+  }
+
   if (const char* stressRuns = std::getenv("VRDX_STRESS_RUNS")) {
     try {
       int runs = static_cast<int>(parseU32(stressRuns));

@@ -40,6 +40,25 @@ Plot results:
 $ python tools/plot.py vulkan.csv cuda.csv --output results.png
 ```
 
+Additional Vulkan stability modes:
+
+```bash
+# Boundary sizes and adversarial key distributions.
+VRDX_STRESS_RUNS=5 VRDX_FENCE_TIMEOUT_MS=30000 \
+  ./build/bench vulkan stress.csv
+
+# Repeated sorts in one command buffer, one multi-command-buffer submit,
+# and multiple submits without intermediate fence waits.
+VRDX_SUBGROUP_SIZE=32 \
+VRDX_SUBMISSION_STRESS_RUNS=5 \
+VRDX_SUBMISSION_STRESS_BATCH=32 \
+VRDX_FENCE_TIMEOUT_MS=30000 \
+  ./build/bench vulkan unused.csv
+```
+
+`VRDX_SUBGROUP_SIZE` accepts `auto`, `native`, or an explicit subgroup size. `auto` prefers `32`
+when subgroup size control is available.
+
 ### Results
 
 Test environment: Windows, NVIDIA GeForce RTX 5080, CUDA 13.2, CUB v3.2.0 (Onesweep default).

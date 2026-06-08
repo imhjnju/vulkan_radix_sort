@@ -26,6 +26,7 @@ class VulkanBenchmark : public BenchmarkBase {
   Results Sort(const std::vector<uint32_t>& keys) override;
   Results SortKeyValue(const std::vector<uint32_t>& keys,
                        const std::vector<uint32_t>& values) override;
+  bool RunSubmissionStress(uint32_t runs, uint32_t batch_size) override;
 
  protected:
   void Reallocate(Buffer* buffer, VkDeviceSize size, VkBufferUsageFlags usage, bool mapped = false);
@@ -43,6 +44,8 @@ class VulkanBenchmark : public BenchmarkBase {
   VkFence fence_ = VK_NULL_HANDLE;
   VkQueryPool query_pool_ = VK_NULL_HANDLE;
   float timestamp_period_ = 1.0f;
+  uint32_t subgroup_size_ = 0;
+  uint32_t required_subgroup_size_ = 0;
 
   VrdxSorter sorter_ = VK_NULL_HANDLE;
   Buffer keys_;

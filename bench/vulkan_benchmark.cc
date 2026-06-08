@@ -7,6 +7,7 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 namespace {
 
@@ -14,8 +15,14 @@ uint32_t Align(uint32_t a, uint32_t b) { return (a + b - 1) / b * b; }
 
 constexpr auto timestamp_count = 15;
 constexpr uint64_t kDefaultFenceTimeoutMs = 30000;
+constexpr uint32_t kWorkgroupSize = 256;
 
 bool DetailedProfilingEnabled() { return std::getenv("VRDX_PROFILE") != nullptr; }
+
+std::string RequestedSubgroupMode() {
+  const char* value = std::getenv("VRDX_SUBGROUP_SIZE");
+  return value == nullptr ? "auto" : value;
+}
 
 uint64_t FenceTimeoutNs() {
   const char* value = std::getenv("VRDX_FENCE_TIMEOUT_MS");
@@ -191,10 +198,12 @@ VulkanBenchmark::VulkanBenchmark() {
       "VK_KHR_portability_subset",
 #endif
   };
+  std::string subgroup_mode = RequestedSubgroupMode();
   if (has_device_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME)) {
     device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
   }
-  if (has_device_extension(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+  if (subgroup_mode != "native" &&
+      has_device_extension(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
     device_extensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
   }
 
@@ -206,10 +215,12 @@ VulkanBenchmark::VulkanBenchmark() {
 
   VkPhysicalDeviceSubgroupSizeControlFeatures enabled_subgroup_size_features = {
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES};
-  enabled_subgroup_size_features.subgroupSizeControl =
-      subgroup_size_features.subgroupSizeControl;
-  enabled_subgroup_size_features.computeFullSubgroups =
-      subgroup_size_features.computeFullSubgroups;
+  if (subgroup_mode != "native") {
+    enabled_subgroup_size_features.subgroupSizeControl =
+        subgroup_size_features.subgroupSizeControl;
+    enabled_subgroup_size_features.computeFullSubgroups =
+        subgroup_size_features.computeFullSubgroups;
+  }
 
   VkDeviceCreateInfo device_info = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
   if (enabled_subgroup_size_features.subgroupSizeControl) {
@@ -274,14 +285,41 @@ VulkanBenchmark::VulkanBenchmark() {
   properties.pNext = &subgroup_properties;
   subgroup_properties.pNext = &subgroup_size_properties;
   vkGetPhysicalDeviceProperties2(physical_device_, &properties);
-  if (enabled_subgroup_size_features.subgroupSizeControl &&
-      subgroup_size_properties.minSubgroupSize <= 32 &&
-      subgroup_size_properties.maxSubgroupSize >= 32 &&
-      (subgroup_size_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)) {
-    sorter_info.requiredSubgroupSize = 32;
-  } else if (subgroup_properties.subgroupSize < 32) {
+
+  const bool can_require_subgroup =
+      enabled_subgroup_size_features.subgroupSizeControl &&
+      (subgroup_size_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+  uint32_t requested_subgroup_size = 0;
+  if (subgroup_mode == "auto") {
+    if (can_require_subgroup && subgroup_size_properties.minSubgroupSize <= 32 &&
+        subgroup_size_properties.maxSubgroupSize >= 32) {
+      requested_subgroup_size = 32;
+    }
+  } else if (subgroup_mode != "native") {
+    char* end = nullptr;
+    unsigned long value = std::strtoul(subgroup_mode.c_str(), &end, 10);
+    if (end == subgroup_mode.c_str() || *end != '\0' || value > UINT32_MAX) {
+      throw std::runtime_error("VRDX_SUBGROUP_SIZE must be auto, native, or a positive integer");
+    }
+    requested_subgroup_size = static_cast<uint32_t>(value);
+    if (!can_require_subgroup ||
+        requested_subgroup_size < subgroup_size_properties.minSubgroupSize ||
+        requested_subgroup_size > subgroup_size_properties.maxSubgroupSize ||
+        requested_subgroup_size < 32 || kWorkgroupSize % requested_subgroup_size != 0) {
+      throw std::runtime_error("Requested Vulkan subgroup size is unsupported by this device");
+    }
+  }
+
+  subgroup_size_ =
+      requested_subgroup_size ? requested_subgroup_size : subgroup_properties.subgroupSize;
+  required_subgroup_size_ = requested_subgroup_size;
+  if (subgroup_size_ < 32 || kWorkgroupSize % subgroup_size_ != 0) {
     throw std::runtime_error("vk_radix_sort requires a compute subgroup size of at least 32");
   }
+  sorter_info.requiredSubgroupSize = required_subgroup_size_;
+  std::cout << "Vulkan subgroup: native=" << subgroup_properties.subgroupSize
+            << " selected=" << subgroup_size_
+            << (required_subgroup_size_ ? " (required)" : " (native)") << std::endl;
   vrdxCreateSorter(&sorter_info, &sorter_);
 }
 
@@ -329,6 +367,214 @@ void VulkanBenchmark::Reallocate(Buffer* buffer, VkDeviceSize size, VkBufferUsag
   buffer->usage = usage;
   buffer->size = size;
   if (mapped) buffer->map = reinterpret_cast<uint8_t*>(allocation_info.pMappedData);
+}
+
+bool VulkanBenchmark::RunSubmissionStress(uint32_t runs, uint32_t batch_size) {
+  if (runs == 0 || batch_size == 0) {
+    throw std::runtime_error("Submission stress runs and batch size must be positive");
+  }
+
+  auto begin_command_buffer = [&](VkCommandBuffer command_buffer,
+                                  VkCommandBufferUsageFlags flags) {
+    vkResetCommandBuffer(command_buffer, 0);
+    VkCommandBufferBeginInfo begin_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = flags;
+    VkResult result = vkBeginCommandBuffer(command_buffer, &begin_info);
+    if (result != VK_SUCCESS) {
+      throw std::runtime_error("vkBeginCommandBuffer failed with VkResult " +
+                               std::to_string(result));
+    }
+  };
+
+  auto submit_and_wait = [&](const std::vector<VkCommandBuffer>& command_buffers,
+                             const char* stage) {
+    VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = static_cast<uint32_t>(command_buffers.size());
+    submit.pCommandBuffers = command_buffers.data();
+    VkResult result = vkQueueSubmit(queue_, 1, &submit, fence_);
+    if (result != VK_SUCCESS) {
+      throw std::runtime_error(std::string("vkQueueSubmit failed during ") + stage +
+                               " with VkResult " + std::to_string(result));
+    }
+    WaitForFence(device_, fence_, stage);
+    vkResetFences(device_, 1, &fence_);
+  };
+
+  auto chain_barrier = [](VkCommandBuffer command_buffer) {
+    VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(command_buffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT |
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+  };
+
+  for (uint32_t run = 0; run < runs; ++run) {
+    uint32_t element_count = run % 2 == 0 ? 262145u : 65537u;
+    uint32_t inout_size =
+        std::max(Align(element_count * static_cast<uint32_t>(sizeof(uint32_t)), 16), 16u);
+
+    std::vector<uint32_t> input_keys(element_count);
+    std::vector<uint32_t> input_values(element_count);
+    for (uint32_t i = 0; i < element_count; ++i) {
+      input_keys[i] = ((i * 2654435761u) ^ (run * 2246822519u)) & 0xffu;
+      input_values[i] = i;
+    }
+
+    std::vector<uint32_t> expected_keys = input_keys;
+    std::sort(expected_keys.begin(), expected_keys.end());
+    std::vector<std::pair<uint32_t, uint32_t>> expected_pairs(element_count);
+    for (uint32_t i = 0; i < element_count; ++i) {
+      expected_pairs[i] = {input_keys[i], input_values[i]};
+    }
+    std::stable_sort(expected_pairs.begin(), expected_pairs.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    Reallocate(&staging_, 2 * inout_size,
+               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, true);
+    Reallocate(&keys_, 2 * inout_size,
+               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    VrdxSorterStorageRequirements requirements;
+    vrdxGetSorterKeyValueStorageRequirements(sorter_, element_count, &requirements);
+    Reallocate(&storage_, requirements.size, requirements.usage);
+
+    auto upload = [&] {
+      std::memcpy(staging_.map, input_keys.data(), element_count * sizeof(uint32_t));
+      std::memcpy(staging_.map + inout_size, input_values.data(),
+                  element_count * sizeof(uint32_t));
+      vmaFlushAllocation(allocator_, staging_.allocation, 0, 2 * inout_size);
+
+      begin_command_buffer(command_buffer_, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+      VkBufferCopy copy = {};
+      copy.size = 2 * inout_size;
+      vkCmdCopyBuffer(command_buffer_, staging_.buffer, keys_.buffer, 1, &copy);
+      vkEndCommandBuffer(command_buffer_);
+      submit_and_wait({command_buffer_}, "submission stress upload");
+    };
+
+    auto read_and_check = [&](bool key_value, const char* mode) {
+      begin_command_buffer(command_buffer_, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+      VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+      vkCmdPipelineBarrier(command_buffer_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0,
+                           nullptr);
+      VkBufferCopy copy = {};
+      copy.size = key_value ? 2 * inout_size : inout_size;
+      vkCmdCopyBuffer(command_buffer_, keys_.buffer, staging_.buffer, 1, &copy);
+      vkEndCommandBuffer(command_buffer_);
+      submit_and_wait({command_buffer_}, "submission stress readback");
+
+      vmaInvalidateAllocation(allocator_, staging_.allocation, 0, copy.size);
+      const uint32_t* output_keys = reinterpret_cast<const uint32_t*>(staging_.map);
+      for (uint32_t i = 0; i < element_count; ++i) {
+        uint32_t expected_key = key_value ? expected_pairs[i].first : expected_keys[i];
+        if (output_keys[i] != expected_key) {
+          std::cerr << mode << " key mismatch at " << i << std::endl;
+          return false;
+        }
+      }
+      if (key_value) {
+        const uint32_t* output_values =
+            reinterpret_cast<const uint32_t*>(staging_.map + inout_size);
+        for (uint32_t i = 0; i < element_count; ++i) {
+          if (output_values[i] != expected_pairs[i].second) {
+            std::cerr << mode << " value mismatch at " << i << std::endl;
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+
+    auto record_sort = [&](VkCommandBuffer command_buffer, bool key_value,
+                           uint32_t repeat_count) {
+      begin_command_buffer(command_buffer, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
+      chain_barrier(command_buffer);
+      for (uint32_t i = 0; i < repeat_count; ++i) {
+        if (key_value) {
+          vrdxCmdSortKeyValue(command_buffer, sorter_, element_count, keys_.buffer, 0,
+                              keys_.buffer, inout_size, storage_.buffer, 0, VK_NULL_HANDLE, 0);
+        } else {
+          vrdxCmdSort(command_buffer, sorter_, element_count, keys_.buffer, 0,
+                      storage_.buffer, 0, VK_NULL_HANDLE, 0);
+        }
+        if (i + 1 < repeat_count) chain_barrier(command_buffer);
+      }
+      vkEndCommandBuffer(command_buffer);
+    };
+
+    for (bool key_value : {false, true}) {
+      const char* sort_name = key_value ? "key-value" : "keys";
+
+      upload();
+      record_sort(command_buffer_, key_value, batch_size);
+      submit_and_wait({command_buffer_}, "same-command-buffer sort chain");
+      if (!read_and_check(key_value, "same-command-buffer")) return false;
+      std::cout << "Submission stress run " << run + 1 << "/" << runs << " " << sort_name
+                << " same-command-buffer passed" << std::endl;
+
+      upload();
+      std::vector<VkCommandBuffer> command_buffers(batch_size);
+      VkCommandBufferAllocateInfo allocate_info = {
+          VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+      allocate_info.commandPool = command_pool_;
+      allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+      allocate_info.commandBufferCount = batch_size;
+      VkResult result =
+          vkAllocateCommandBuffers(device_, &allocate_info, command_buffers.data());
+      if (result != VK_SUCCESS) {
+        throw std::runtime_error("vkAllocateCommandBuffers failed with VkResult " +
+                                 std::to_string(result));
+      }
+      for (VkCommandBuffer command_buffer : command_buffers) {
+        record_sort(command_buffer, key_value, 1);
+      }
+      submit_and_wait(command_buffers, "multi-command-buffer sort chain");
+      vkFreeCommandBuffers(device_, command_pool_, batch_size, command_buffers.data());
+      if (!read_and_check(key_value, "multi-command-buffer")) return false;
+      std::cout << "Submission stress run " << run + 1 << "/" << runs << " " << sort_name
+                << " multi-command-buffer passed" << std::endl;
+
+      upload();
+      command_buffers.resize(batch_size);
+      result = vkAllocateCommandBuffers(device_, &allocate_info, command_buffers.data());
+      if (result != VK_SUCCESS) {
+        throw std::runtime_error("vkAllocateCommandBuffers failed with VkResult " +
+                                 std::to_string(result));
+      }
+      for (VkCommandBuffer command_buffer : command_buffers) {
+        record_sort(command_buffer, key_value, 1);
+      }
+      for (uint32_t i = 0; i < batch_size; ++i) {
+        VkSubmitInfo submit = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &command_buffers[i];
+        VkFence submit_fence = i + 1 == batch_size ? fence_ : VK_NULL_HANDLE;
+        result = vkQueueSubmit(queue_, 1, &submit, submit_fence);
+        if (result != VK_SUCCESS) {
+          throw std::runtime_error("vkQueueSubmit failed during no-wait chain with VkResult " +
+                                   std::to_string(result));
+        }
+      }
+      WaitForFence(device_, fence_, "no-wait multi-submit sort chain");
+      vkResetFences(device_, 1, &fence_);
+      vkFreeCommandBuffers(device_, command_pool_, batch_size, command_buffers.data());
+      if (!read_and_check(key_value, "no-wait-multi-submit")) return false;
+      std::cout << "Submission stress run " << run + 1 << "/" << runs << " " << sort_name
+                << " no-wait-multi-submit passed" << std::endl;
+    }
+  }
+
+  std::cout << "Submission stress passed: subgroup=" << subgroup_size_ << " runs=" << runs
+            << " batch=" << batch_size << std::endl;
+  return true;
 }
 
 VulkanBenchmark::Results VulkanBenchmark::Sort(const std::vector<uint32_t>& keys) {

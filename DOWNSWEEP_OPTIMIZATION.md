@@ -2,7 +2,7 @@
 
 最后验证日期：2026-06-07
 
-本文记录 downsweep 优化过程、发现的同步问题、性能取舍，以及 Intel Vulkan 和 HarmonyOS
+本文记录 downsweep 优化过程、发现的同步问题、性能取舍，以及 HarmonyOS 和通用 Vulkan
 环境的回归方法。
 
 ## 修改概览
@@ -31,15 +31,6 @@
 5. Subgroup specialization 初测更快，但最终 baseline A/B 复测没有确认收益。
 
 因此丢弃了无法稳定复现的候选方案。最终实现优先保证跨驱动正确性和可重复性能。
-
-Intel Arc 140T、驱动 `32.0.101.8724`、`N = 1048576` 的最终同步版本参考值：
-
-| 排序类型 | GPU 总时间 | Downsweep 时间 |
-|---|---:|---:|
-| Keys | 2.198 ms | 1.629 ms |
-| Key-value | 3.987 ms | 3.31 ms |
-
-这些数字只用于当前硬件回归，不代表其他 GPU 的性能。
 
 ## 同步问题与规则
 
@@ -137,8 +128,28 @@ VRDX_FENCE_TIMEOUT_MS=30000 \
 - 大量重复值的 2-bit、8-bit 低熵输入。
 - 固定 seed 的随机输入。
 
-最终在 Intel Arc 140T 上连续运行 5 轮，没有 fence timeout、device lost 或正确性错误。CPU
-同类压力测试也完成了 3 轮。
+## Subgroup 与连续提交测试
+
+新增环境变量：
+
+```bash
+VRDX_SUBGROUP_SIZE=auto|native|32|64
+VRDX_SUBMISSION_STRESS_RUNS=5
+VRDX_SUBMISSION_STRESS_BATCH=32
+```
+
+每轮 submission stress 对 keys-only 和稳定 key-value 分别测试：
+
+1. 同一个 command buffer 内连续录制多次 sort。
+2. 多个 command buffer 放在同一个 `vkQueueSubmit` 中。
+3. 多次调用 `vkQueueSubmit`，中间不等待 fence，只在最后一次 submit 等待。
+
+连续 sort 之间显式加入 compute shader write 到后续 transfer/compute read-write 的 barrier。
+这是合法的调用方式测试，不测试调用方故意遗漏外部同步的未定义行为。
+
+在目标 HarmonyOS 设备上，应分别验证驱动选择的 native subgroup 路径和设备支持的显式 subgroup
+配置。不能仅根据查询到的 subgroup 属性推断 shader 正确性，必须运行完整的 keys/KV、边界输入和
+连续提交测试。
 
 ## 构建与校验
 
@@ -193,8 +204,10 @@ git diff --check
 
 - Barrier 数量影响性能，但缺少必要 barrier 是正确性问题，不是优化。
 - Subgroup 行为必须符合 Vulkan/SPIR-V 约定，不能依赖单一驱动的表现。
+- 查询 subgroup 属性不能替代对应 pipeline 配置的实际正确性测试。
 - 低熵和大量重复 key 特别适合暴露 histogram 竞争和顺序问题。
 - 零长度和各种边界长度应成为固定回归用例。
 - GPU 测试必须设置有限的 Host 等待时间，避免真正的永久挂死。
+- 连续 command buffer 和无中间 fence 的多 submit 是必要的同步回归场景。
 - GPU 时钟和驱动状态会污染初期数据，候选方案必须经过最终 baseline 复测。
 - 编译通过、SPIR-V 合法、结果正确、长期稳定和性能提升是五个独立检查项。

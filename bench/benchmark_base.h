@@ -28,6 +28,7 @@ class BenchmarkBase {
   virtual Results Sort(const std::vector<uint32_t>& keys) = 0;
   virtual Results SortKeyValue(const std::vector<uint32_t>& keys,
                                const std::vector<uint32_t>& values) = 0;
+  virtual bool RunSubmissionStress(uint32_t runs, uint32_t batch_size) { return false; }
 
 };
 
