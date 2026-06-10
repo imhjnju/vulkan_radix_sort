@@ -1,4 +1,4 @@
-# Vulkan Radix Sort Benchmark Results — Maleoon 935
+# Radix Sort Benchmark Results — Maleoon 935
 
 Date: 2026-06-10
 
@@ -7,122 +7,151 @@ Date: 2026-06-10
 | Item | Value |
 |------|-------|
 | **Device** | HarmonyOS arm64 phone |
-| **GPU** | Maleoon 935, Vulkan 1.4.309 |
-| **CPU** | 4×1.53 GHz + 8×2.10 GHz + 2×2.75 GHz (big.LITTLE) |
-| **CPU sort** | `std::sort` / `std::stable_sort`, pinned to big cores (cpu12-13) |
-| **GPU sort** | Vulkan compute radix sort, WORKGROUP_SIZE=256, subgroupSize=32 |
+| **GPU** | Maleoon 935, Vulkan 1.4.309, subgroupSize=32 |
+| **CPU** | Kirin big.LITTLE: 4×1.72 GHz + 8×2.27 GHz + 2×2.75 GHz |
+| **CPU sort** | `std::sort` / `std::stable_sort`, pinned to big cores (cpu12-13, 2.75 GHz) |
+| **Frequency** | All 14 CPU cores locked to max via `scaling_min_freq = scaling_max_freq` |
+| **GPU timing** | `vkCmdWriteTimestamp` × `timestampPeriod` (~107 ns/tick) |
+| **CPU timing** | `std::chrono::high_resolution_clock` for `std::sort` |
 | **Build** | HarmonyOS NDK cross-compiled, `-DCMAKE_BUILD_TYPE=Release` |
-| **Measurement** | GPU: `vkCmdWriteTimestamp` × `timestampPeriod`; CPU: `chrono::high_resolution_clock` |
 | **Sizes** | 1K, 2K, 4K, 8K, 16K, 32K, 64K, 128K, 256K, 512K, 1M |
 
-## Locked Max Frequency Results
+## Algorithms Compared
 
-All CPU cores locked to max frequency via `scaling_min_freq = scaling_max_freq`:
+| Algorithm | Source | Dispatch/Pass | Pipeline |
+|-----------|--------|---------------|----------|
+| **CPU std::sort** | C++ STL | — | — |
+| **vulkan_radix_sort** | [vulkan_radix_sort](.) | 3 dispatch/pass (upsweep→spine→downsweep) × 4 passes | Created once |
+| **VkRadixSort Multi** | [VkRadixSort](../VkRadixSort) | 2 dispatch/pass (histogram→scatter) × 4 passes | Created once (reused) |
 
-| Core Group | Cores | Locked Freq |
-|------------|-------|-------------|
-| LITTLE | cpu0,1,6,7 | 1.53 GHz |
-| Mid | cpu2,3,8–11 | 2.10 GHz |
-| Big | cpu4,5,12,13 | 2.75 GHz |
+Both GPU radix sorts operate on 32-bit keys with 4 × 8-bit radix passes and `WORKGROUP_SIZE=256`.
 
-### Keys Sort (Locked Max Freq)
+## Full Comparison (Locked Max Freq)
 
-| N | GPU (ms) | CPU std::sort (ms) | GPU Speedup |
+![Three-way comparison](benchmark_comparison_full.png)
+
+### Keys-only Sort
+
+| N | CPU (ms) | vulkan_radix_sort (ms) | VkRadixSort Multi (ms) | vrs/CPU | vkr/CPU | vkr/vrs |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1K | 0.039 | 0.808 | 0.643 | 0.05× | 0.06× | 0.80× |
+| 2K | 0.080 | 0.717 | 0.752 | 0.11× | 0.11× | 1.05× |
+| 4K | 0.168 | 0.728 | 0.922 | 0.23× | 0.18× | 1.27× |
+| 8K | 0.349 | 0.774 | 1.233 | 0.45× | 0.28× | 1.59× |
+| 16K | 0.761 | 0.836 | 1.268 | 0.91× | 0.60× | 1.52× |
+| **32K** | **1.658** | **1.340** | **1.428** | **1.24×** | **1.16×** | **1.07×** |
+| 64K | 3.542 | 1.998 | 2.037 | 1.77× | 1.74× | 1.02× |
+| 128K | 7.562 | 3.409 | 4.766 | 2.22× | 1.59× | 1.40× |
+| 256K | 15.984 | 5.166 | 8.911 | 3.09× | 1.79× | 1.72× |
+| 512K | 33.920 | 8.594 | 17.320 | 3.95× | 1.96× | 2.02× |
+| **1M** | **71.779** | **16.073** | **27.010** | **4.47×** | **2.66×** | **1.68×** |
+
+> **vrs/CPU** = vulkan_radix_sort acceleration ratio vs CPU (>1 = GPU faster)
+> **vkr/CPU** = VkRadixSort Multi acceleration ratio vs CPU
+> **vkr/vrs** = VkRadixSort time / vulkan_radix_sort time (>1 = vulkan_radix_sort faster)
+
+### Key-Value Sort (vulkan_radix_sort only)
+
+| N | CPU kv (ms) | vrs kv GPU (ms) | GPU Speedup |
 |---:|---:|---:|---:|
-| 1K | 0.796 | 0.039 | 0.05× (CPU faster) |
-| 2K | 0.774 | 0.080 | 0.10× |
-| 4K | 0.732 | 0.168 | 0.23× |
-| 8K | 0.769 | 0.356 | 0.46× |
-| 16K | 0.932 | 0.763 | 0.82× |
-| **32K** | **1.284** | **1.645** | **1.28×** |
-| 64K | 1.833 | 3.507 | 1.91× |
-| 128K | 3.510 | 7.602 | 2.17× |
-| 256K | 5.136 | 16.036 | 3.12× |
-| 512K | 8.598 | 33.799 | 3.93× |
-| **1M** | **16.076** | **72.212** | **4.49×** |
+| 1K | 0.054 | 0.888 | 0.06× |
+| 2K | 0.117 | 0.818 | 0.14× |
+| 4K | 0.221 | 0.846 | 0.26× |
+| 8K | 0.513 | 0.894 | 0.57× |
+| 16K | 1.022 | 1.021 | 1.00× |
+| **32K** | **2.383** | **1.628** | **1.46×** |
+| 64K | 4.766 | 2.751 | 1.73× |
+| 128K | 11.038 | 3.681 | 3.00× |
+| 256K | 22.168 | 6.541 | 3.39× |
+| 512K | 50.721 | 10.899 | 4.65× |
+| **1M** | **105.365** | **18.835** | **5.59×** |
 
-### Key-Value Sort (Locked Max Freq)
+### Scaling Curves
 
-| N | GPU (ms) | CPU std::stable_sort (ms) | GPU Speedup |
+![Scaling comparison](benchmark_comparison_scaling.png)
+
+## Key Findings
+
+### 1. Crossover Point
+
+Both GPU radix sorts surpass CPU `std::sort` at **N ≈ 32K**:
+
+| Algorithm | Crossover N | Speedup at Crossover |
+|-----------|:-----------:|:--------------------:|
+| vulkan_radix_sort | 32K | 1.24× |
+| VkRadixSort Multi | 32K | 1.16× |
+
+At N < 32K, the GPU launch overhead (~0.7 ms) dominates actual sort time, making CPU faster.
+
+### 2. vulkan_radix_sort vs VkRadixSort Multi
+
+vulkan_radix_sort is consistently faster than VkRadixSort Multi across nearly all sizes:
+
+| Size Range | vkr/vrs Ratio | Interpretation |
+|------------|:------------:|----------------|
+| N ≤ 2K | 0.80–1.05× | Roughly equivalent |
+| 4K–16K | 1.27–1.59× | vulkan_radix_sort 30–60% faster |
+| 32K–64K | 1.02–1.07× | Nearly tied |
+| 128K–1M | 1.40–2.02× | vulkan_radix_sort 40–100% faster |
+
+**Why vulkan_radix_sort wins despite 3 dispatches per pass:**
+- 3-pass (upsweep/spine/downsweep) has more dispatches but each is lighter weight
+- 2-pass (histogram/scatter) does more work per dispatch but has higher register pressure
+- At large N, the algorithmic efficiency of 3-pass wins decisively
+
+### 3. Peak Performance (N=1M, Locked)
+
+| Sort | GPU (ms) | CPU (ms) | GPU Speedup |
+|------|--------:|--------:|------------:|
+| **vulkan_radix_sort keys** | 16.07 | 71.78 | **4.47×** |
+| **vulkan_radix_sort kv** | 18.84 | 105.37 | **5.59×** |
+| VkRadixSort Multi keys | 27.01 | 71.78 | 2.66× |
+
+### 4. Effect of Pipeline Reuse
+
+VkRadixSort originally recreated its Vulkan pipeline (shaders, descriptor pools, command pools, sync objects) for every benchmark size. After refactoring to `init()/execute()/cleanup()`, the pipeline is created once and reused:
+
+| N | Before (ms) | After (ms) | Improvement |
 |---:|---:|---:|---:|
-| 1K | 0.837 | 0.054 | 0.06× (CPU faster) |
-| 2K | 0.821 | 0.117 | 0.14× |
-| 4K | 0.853 | 0.217 | 0.25× |
-| 8K | 0.913 | 0.512 | 0.56× |
-| 16K | 1.124 | 1.018 | 0.91× |
-| **32K** | **1.643** | **2.388** | **1.45×** |
-| 64K | 2.771 | 4.778 | 1.72× |
-| 128K | 3.688 | 11.039 | 2.99× |
-| 256K | 6.595 | 22.236 | 3.37× |
-| 512K | 10.886 | 50.654 | 4.65× |
-| **1M** | **18.572** | **104.204** | **5.61×** |
+| 1K | 1.114 | 0.643 | −42.3% |
+| 32K | 2.056 | 1.428 | −30.5% |
+| 1M | 26.620 | 27.010 | +1.5% |
 
-## Dynamic Frequency Results (Default Governor)
+Pipeline creation overhead is significant at small N but negligible at large N where GPU computation dominates.
 
-Default `misc` governor, CPU frequencies dynamically scaled. CPU pinned to big cores but governor may downclock.
+### 5. CPU Scaling
 
-### Keys Sort (Dynamic)
+CPU `std::sort` at locked 2.75 GHz follows O(N log N) exactly. The normalized time T/(N·log₂N) converges to **~3.4 ns** for N ≥ 16K, which is ~9.4 clock cycles per comparison-swap on the Cortex core.
 
-| N | GPU (ms) | CPU std::sort (ms) | GPU Speedup |
-|---:|---:|---:|---:|
-| 1K | 1.085 | 0.084 | 0.08× |
-| 2K | 1.178 | 0.179 | 0.15× |
-| 4K | 1.185 | 0.328 | 0.28× |
-| 8K | 1.171 | 0.586 | 0.50× |
-| 16K | 1.281 | 0.959 | 0.75× |
-| 32K | 1.838 | 1.659 | 0.90× |
-| **64K** | **2.631** | **3.574** | **1.36×** |
-| 128K | 4.521 | 7.585 | 1.68× |
-| 256K | 7.032 | 16.102 | 2.29× |
-| 512K | 9.336 | 33.974 | 3.64× |
-| **1M** | **18.809** | **71.615** | **3.81×** |
+## Fair Comparison Methodology
 
-## Analysis
+To ensure a fair comparison between the two GPU radix sort implementations:
 
-### Effect of Locking Max Frequency
+1. **Pipeline reuse**: Both implementations create their Vulkan pipeline once before the benchmark loop
+2. **Same GPU timestamp method**: Both use `vkCmdWriteTimestamp` × `timestampPeriod` for GPU timing
+3. **Same CPU frequency**: All cores locked to max frequency
+4. **Same test data**: 32-bit unsigned integers, uniform random distribution
+5. **Same sizes**: Power-of-2 from 1K to 1M
+6. **Correctness verified**: Each size verified against CPU `std::sort` result
 
-Locking all cores to max freq improved:
+### Remaining differences in submit/fence patterns
 
-| Component | Small N (≤8K) | Large N (≥64K) |
-|-----------|--------------|----------------|
-| **GPU** | 36–62% faster | 9–44% faster |
-| **CPU** | 26–123% faster | 0–2% faster |
+- **vulkan_radix_sort**: Each sort uses separate `vkQueueSubmit` + `vkWaitForFences` calls (upload → fence, sort → fence, readback → fence = 3 submissions). GPU time measured by 2 timestamp queries (start/end of sort dispatches only).
+- **VkRadixSort Multi**: Uses semaphore-chained dispatches within 4 iterations, with `vkQueueWaitIdle` at end. GPU time measured by 8 timestamp queries (2 per iteration, summed).
 
-GPU gains are significant across all sizes because the GPU driver threads also benefit from locked CPU frequencies (command submission, fence polling run on CPU). CPU gains are concentrated at small N where the governor hasn't ramped up yet; at large N the dynamic governor already scales to near-max.
+This means the GPU timestamp measurements capture pure compute time in both cases, but the wall-clock submit/fence overhead is different. The GPU timestamp numbers are comparable; the submit patterns are inherent to each algorithm's design.
 
-### GPU Launch Overhead
+## Device Info
 
-At locked max freq, GPU latency floor drops from ~1.2 ms to ~0.75 ms for N ≤ 8K. CPU `std::sort` at small N is still much faster due to near-zero overhead.
-
-### Crossover Point
-
-- **Locked**: GPU overtakes CPU at **N ≈ 32K** (both keys and KV)
-- **Dynamic**: GPU overtakes CPU at **N ≈ 32K–64K**
-
-Locking improves the crossover slightly by reducing GPU driver overhead.
-
-### Scaling Behavior
-
-**CPU** `std::sort` (introsort) follows O(N log N) exactly. At locked 2.75 GHz, the normalized time `T / (N·log₂N)` converges to **3.40 ns** for N ≥ 16K, which is ~9.4 clock cycles per comparison-swap.
-
-**GPU** radix sort is O(N) with 4 passes × 8-bit radix. At locked max freq, peak throughput at N=1M reaches **0.065 GItems/s (65 MItems/s)** for keys.
-
-### Peak Performance (N=1M, Locked)
-
-| Sort | GPU | CPU | GPU Speedup |
-|------|----:|----:|------------:|
-| Keys | 16.08 ms | 72.21 ms | **4.49×** |
-| Key-Value | 18.57 ms | 104.20 ms | **5.61×** |
-
-## timestampPeriod Note
-
-The Maleoon 935 reports `timestampPeriod ≈ 107 ns/tick`. GPU timestamp query results must be multiplied by this value to convert raw ticks to nanoseconds.
+- **SoC**: Kirin (ARM big.LITTLE, 14 cores)
+- **CPU topology**: 4×1.72 GHz (LITTLE) + 8×2.27 GHz (mid) + 2×2.75 GHz (big)
+- **GPU**: Maleoon 935, Vulkan 1.4.309
+- **subgroupSize**: 32, maxComputeInvocations=1024, maxSharedMemory=32768
+- **timestampPeriod**: ~107 ns/tick
 
 ## Raw Data
 
-- `vulkan_perf_locked.csv` — GPU benchmark, all cores locked max freq
-- `cpu_perf_locked.csv` — CPU benchmark, all cores locked max freq
-- `vulkan_perf.csv` — GPU benchmark, default dynamic governor
-- `cpu_perf.csv` — CPU benchmark, default dynamic governor
-- `gpu_vs_cpu_locked.png` — locked vs dynamic comparison chart
-- `gpu_vs_cpu_correct.png` — dynamic governor comparison chart
+- `vulkan_perf_locked.csv` — vulkan_radix_sort GPU, locked max freq
+- `cpu_perf_locked.csv` — CPU std::sort, locked max freq
+- `benchmark_comparison_full.png` — 3-panel comparison chart
+- `benchmark_comparison_scaling.png` — log-log scaling curves
