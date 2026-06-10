@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <sched.h>
+#include <unistd.h>
 
 namespace {
 
@@ -10,9 +12,22 @@ int64_t GetTimestamp() {
   return std::chrono::high_resolution_clock::now().time_since_epoch().count();
 }
 
+void PinToBigCores() {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  // cpu12-13: 2.75 GHz big cores
+  CPU_SET(12, &set);
+  CPU_SET(13, &set);
+  if (sched_setaffinity(getpid(), sizeof(set), &set) != 0) {
+    std::cerr << "Warning: failed to pin CPU benchmark to big cores" << std::endl;
+  }
+}
+
 }  // namespace
 
-CpuBenchmark::CpuBenchmark() = default;
+CpuBenchmark::CpuBenchmark() {
+  PinToBigCores();
+}
 
 CpuBenchmark::~CpuBenchmark() = default;
 

@@ -1,0 +1,15 @@
+{
+  "last_self_review": "2026-06-10T08:47:02.583Z",
+  "last_self_review_by": "agent-main",
+  "last_self_review_evidence": ".kirinharness/review_evidence/review_20260610_164500.md",
+  "last_self_review_evidence_sha256": "3e2f6219168735bd2df62d5c4ba060476a442154e2cbb747ee495d5194f76246",
+  "last_self_review_tree": "scope:v1:b78bbd31e42d690f77113f5466d581a37c50092d42fcea5ebb0026c7f195a204",
+  "review_pending": false,
+  "last_external_review": "2026-06-10T08:47:11.587Z",
+  "last_external_review_by": "sub-agent:independent-context",
+  "last_external_review_evidence": ".kirinharness/review_evidence/review_20260610_164500.md",
+  "last_external_review_evidence_sha256": "3e2f6219168735bd2df62d5c4ba060476a442154e2cbb747ee495d5194f76246",
+  "last_external_review_source": "fresh-agent",
+  "last_external_review_tree": "scope:v1:b78bbd31e42d690f77113f5466d581a37c50092d42fcea5ebb0026c7f195a204",
+  "last_external_review_verdict": "clean"
+}
