@@ -8,9 +8,9 @@ Date: 2026-06-11
 |------|-------|
 | **Device** | HarmonyOS arm64 phone |
 | **GPU** | Maleoon 935, Vulkan 1.4.309, subgroupSize=32 |
-| **GPU freq** | Locked 933 MHz (max), was 235 MHz idle / DVFS auto |
-| **DDR freq** | Locked 4800 MHz (max), was 1066 MHz idle / DVFS auto |
-| **L1 bus freq** | Locked 1172 MHz (max) |
+| **GPU freq** | Locked 933 MHz (was 235 MHz under DVFS auto) |
+| **DDR freq** | Locked 4800 MHz (was 1066 MHz under DVFS auto) |
+| **L1 bus freq** | Locked 1172 MHz |
 | **CPU** | Kirin big.LITTLE: 4×1.72 GHz + 8×2.27 GHz + 2×2.75 GHz |
 | **CPU freq** | All 14 cores locked to max |
 | **CPU sort** | `std::sort` / `std::stable_sort`, pinned to big cores (cpu12-13, 2.75 GHz) |
@@ -35,24 +35,24 @@ DVFS auto mode had GPU running at 235 MHz (25% of max) and DDR at 1066 MHz (22% 
 
 ## Algorithms Compared
 
-| Algorithm | Source | Dispatch/Pass | Pipeline | Warmup | Runs |
-|-----------|--------|---------------|----------|--------|------|
-| **CPU std::sort** | C++ STL | — | — | 5 | 10 (median) |
-| **vulkan_radix_sort** | [vulkan_radix_sort](.) | 3 dispatch/pass (upsweep→spine→downsweep) × 4 passes | Created once | 5 | 10 (median) |
-| **VkRadixSort Multi** | [VkRadixSort](../VkRadixSort) | 2 dispatch/pass (histogram→scatter) × 4 passes | Created once (reused) | 5 | 10 (median) |
+| Algorithm | Source | Dispatch/Pass | Pipeline | Submit | Warmup | Runs |
+|-----------|--------|---------------|----------|--------|--------|------|
+| **CPU std::sort** | C++ STL | — | — | — | 5 | 10 (median) |
+| **vulkan_radix_sort** | [vulkan_radix_sort](.) | 3 dispatch/pass (upsweep→spine→downsweep) × 4 passes | Created once | **1×** | 5 | 10 (median) |
+| **VkRadixSort Multi** | [VkRadixSort](../VkRadixSort) | 2 dispatch/pass (histogram→scatter) × 4 passes | Created once (reused) | **1×** (single cmd buffer) | 5 | 10 (median) |
 
 Both GPU radix sorts operate on 32-bit unsigned integers (full range `[0, 2³²-1]`) with 4 × 8-bit radix passes and `WORKGROUP_SIZE=256`.
 
 ## Timing Methodology
 
-Both GPU implementations use `vkCmdWriteTimestamp` with `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT` to measure the **envelope** time from first to last timestamp:
+Both GPU implementations use `vkCmdWriteTimestamp` with `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT` to measure the **envelope** time from first to last timestamp, both recorded in a **single command buffer** submitted once:
 
-- **vulkan_radix_sort**: 2 timestamps (start/end) around the entire sort command buffer → single envelope
-- **VkRadixSort Multi**: 8 timestamps (2 per iteration × 4 iterations) → envelope from first to last timestamp
+- **vulkan_radix_sort**: 2 timestamps around the entire sort (12 dispatch + internal barriers)
+- **VkRadixSort Multi**: 2 timestamps around all 4 iterations (8 dispatch + internal barriers)
 
-This captures the full GPU pipeline including barriers, fill buffer, and inter-dispatch synchronization, making the measurements directly comparable.
+This eliminates any submit/semaphore overhead from the measurement, capturing only GPU compute + internal barrier time.
 
-## Full Comparison (All Frequencies Locked)
+## Full Comparison (All Frequencies Locked, Single Submit)
 
 ![Three-way comparison](benchmark_comparison_full.png)
 
@@ -60,20 +60,20 @@ This captures the full GPU pipeline including barriers, fill buffer, and inter-d
 
 | N | CPU (ms) | vulkan_radix_sort (ms) | VkRadixSort Multi (ms) | vrs/CPU | vkr/CPU | vkr/vrs |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1K | 0.038 | 0.287 | 0.392 | 0.13× | 0.10× | 1.37× |
-| 2K | 0.076 | 0.295 | 0.417 | 0.26× | 0.18× | 1.41× |
-| 4K | 0.167 | 0.298 | 0.473 | 0.56× | 0.35× | 1.59× |
-| **8K** | **0.349** | **0.308** | **0.547** | **1.13×** | 0.64× | 1.78× |
-| **16K** | **0.768** | **0.311** | **0.620** | **2.47×** | **1.24×** | 1.99× |
-| **32K** | **1.641** | **0.442** | **0.566** | **3.71×** | **2.90×** | 1.28× |
-| 64K | 3.503 | 0.610 | 0.865 | 5.74× | 4.05× | 1.42× |
-| 128K | 7.511 | 1.104 | 1.317 | 6.80× | 5.70× | 1.19× |
-| 256K | 15.977 | 2.153 | 2.403 | 7.42× | 6.65× | 1.12× |
-| 512K | 33.768 | 3.936 | 4.631 | 8.58× | 7.29× | 1.18× |
-| **1M** | **71.216** | **7.535** | **9.254** | **9.45×** | **7.70×** | 1.23× |
-| **2M** | **150.964** | **14.713** | **19.042** | **10.26×** | **7.93×** | 1.29× |
-| **4M** | **317.808** | **28.725** | **38.705** | **11.06×** | **8.21×** | 1.35× |
-| **8M** | **684.130** | **57.050** | **132.641** | **11.99×** | **5.16×** | **2.32×** |
+| 1K | 0.039 | 0.286 | 0.257 | 0.14× | 0.15× | **0.90×** |
+| 2K | 0.080 | 0.291 | 0.294 | 0.27× | 0.27× | **1.01×** |
+| 4K | 0.169 | 0.296 | 0.367 | 0.57× | 0.46× | 1.24× |
+| **8K** | **0.357** | **0.304** | **0.509** | **1.17×** | 0.70× | 1.67× |
+| **16K** | **0.773** | **0.313** | **0.516** | **2.47×** | **1.50×** | 1.65× |
+| **32K** | **1.666** | **0.440** | **0.524** | **3.79×** | **3.18×** | 1.19× |
+| 64K | 3.549 | 0.627 | 0.823 | 5.66× | 4.31× | 1.31× |
+| 128K | 7.505 | 1.111 | 1.271 | 6.76× | 5.90× | 1.14× |
+| 256K | 15.963 | 2.140 | 2.367 | 7.46× | 6.74× | 1.11× |
+| 512K | 34.155 | 3.924 | 4.590 | 8.70× | 7.44× | 1.17× |
+| **1M** | **71.957** | **7.530** | **9.216** | **9.56×** | **7.81×** | 1.22× |
+| **2M** | **151.249** | **14.660** | **19.007** | **10.32×** | **7.96×** | 1.30× |
+| **4M** | **314.482** | **28.831** | **38.370** | **10.91×** | **8.20×** | 1.33× |
+| **8M** | **689.529** | **57.240** | **133.113** | **12.05×** | **5.18×** | **2.33×** |
 
 > **vrs/CPU** = CPU time / vulkan_radix_sort time (>1 = GPU faster)
 > **vkr/CPU** = CPU time / VkRadixSort time (>1 = GPU faster)
@@ -83,20 +83,20 @@ This captures the full GPU pipeline including barriers, fill buffer, and inter-d
 
 | N | CPU kv (ms) | vrs kv GPU (ms) | GPU Speedup |
 |---:|---:|---:|---:|
-| 1K | 0.053 | 0.316 | 0.17× |
-| 2K | 0.117 | 0.328 | 0.36× |
-| 4K | 0.220 | 0.330 | 0.67× |
-| 8K | 0.511 | 0.332 | 1.54× |
-| **16K** | **1.018** | **0.360** | **2.83×** |
-| **32K** | **2.379** | **0.526** | **4.52×** |
-| 64K | 4.859 | 0.777 | 6.25× |
-| 128K | 11.114 | 1.468 | 7.57× |
-| 256K | 22.340 | 3.095 | 7.22× |
-| 512K | 50.696 | 5.693 | 8.90× |
-| **1M** | **105.247** | **10.984** | **9.58×** |
-| **2M** | **246.798** | **21.543** | **11.46×** |
-| **4M** | **528.225** | **42.898** | **12.31×** |
-| **8M** | **1249.504** | **85.528** | **14.61×** |
+| 1K | 0.055 | 0.314 | 0.18× |
+| 2K | 0.120 | 0.327 | 0.37× |
+| 4K | 0.219 | 0.329 | 0.67× |
+| **8K** | **0.514** | **0.340** | **1.51×** |
+| **16K** | **1.036** | **0.357** | **2.90×** |
+| **32K** | **2.382** | **0.527** | **4.52×** |
+| 64K | 4.812 | 0.780 | 6.17× |
+| 128K | 11.114 | 1.459 | 7.62× |
+| 256K | 22.171 | 3.060 | 7.25× |
+| 512K | 50.724 | 5.672 | 8.94× |
+| **1M** | **106.556** | **11.030** | **9.66×** |
+| **2M** | **251.300** | **21.694** | **11.58×** |
+| **4M** | **529.222** | **43.150** | **12.27×** |
+| **8M** | **1258.716** | **85.551** | **14.71×** |
 
 ### Scaling Curves
 
@@ -104,77 +104,59 @@ This captures the full GPU pipeline including barriers, fill buffer, and inter-d
 
 ## Key Findings
 
-### 1. DVFS Locking Impact
+### 1. VkRadixSort Wins at Small N
 
-Locking GPU (235→933 MHz) and DDR (1066→4800 MHz) dramatically changed results:
+With single command buffer submission (eliminating the submit/semaphore unfairness), VkRadixSort actually wins at the smallest sizes:
 
-| Metric | DVFS Auto | All Locked | Change |
-|--------|----------:|-----------:|-------:|
-| vrs GPU latency floor | ~0.7 ms | **~0.29 ms** | 2.4× lower |
-| vrs 1M | 16.1 ms | **7.5 ms** | 2.1× faster |
-| vrs 8M | 58.2 ms | **57.0 ms** | 1.02× (already at max) |
-| vkr 1M | 20.3 ms | **9.3 ms** | 2.2× faster |
-| vkr 8M | 147.2 ms | **132.6 ms** | 1.1× faster |
+| N | vkr/vrs | Winner |
+|---:|:-:|---|
+| **1K** | **0.90×** | **VkRadixSort wins by 10%** |
+| **2K** | **1.01×** | **Essentially tied** |
+| 4K | 1.24× | vulkan_radix_sort |
 
-Key insight: Under DVFS auto, the GPU was at 25% frequency (235 MHz) during small-N tests. Large-N tests naturally ramped up frequency, making earlier data appear to show better GPU scaling than actually exists.
+VkRadixSort's advantage at small N comes from fewer dispatches per pass (2 vs 3), meaning lower fixed overhead per radix iteration. The GPU latency floor is 0.257ms (vkr) vs 0.286ms (vrs).
 
 ### 2. Crossover Points
 
 | Algorithm | Crossover N | Speedup at Crossover |
 |-----------|:-----------:|:--------------------:|
-| vulkan_radix_sort | **8K** | 1.13× |
-| VkRadixSort Multi | **16K** | 1.24× |
+| vulkan_radix_sort | **8K** | 1.17× |
+| VkRadixSort Multi | **16K** | 1.50× |
 
-With frequencies locked, crossover drops from 32K/64K to **8K/16K** — the GPU is useful at much smaller sizes than DVFS-auto data suggested.
-
-### 3. vulkan_radix_sort vs VkRadixSort Multi
-
-| Size Range | vkr/vrs | Winner | Margin |
-|------------|:-------:|--------|--------|
-| 1K–2K | 1.37–1.41× | vulkan_radix_sort | 37–41% |
-| 4K | 1.59× | vulkan_radix_sort | 59% |
-| 8K–16K | 1.78–1.99× | vulkan_radix_sort | 78–99% |
-| 32K | 1.28× | vulkan_radix_sort | 28% |
-| 64K–256K | 1.12–1.42× | vulkan_radix_sort | 12–42% |
-| 512K–4M | 1.18–1.35× | vulkan_radix_sort | 18–35% |
-| **8M** | **2.32×** | **vulkan_radix_sort** | **132%** |
-
-vulkan_radix_sort wins at **all sizes** with all frequencies locked. The gap is smallest at 256K (1.12×) and widest at 16K (1.99×) and 8M (2.32×).
-
-### 4. Peak Performance (N=8M, All Locked)
+### 3. Peak Performance (N=8M, All Locked)
 
 | Sort | GPU (ms) | CPU (ms) | GPU Speedup | Throughput |
 |------|--------:|--------:|------------:|-----------:|
-| **vulkan_radix_sort keys** | 57.05 | 684.13 | **11.99×** | **147 MItems/s** |
-| **vulkan_radix_sort kv** | 85.53 | 1249.50 | **14.61×** | 98 MItems/s |
-| VkRadixSort Multi keys | 132.64 | 684.13 | 5.16× | 63 MItems/s |
-| CPU std::sort | — | 684.13 | 1.00× | 12 MItems/s |
+| **vulkan_radix_sort keys** | 57.24 | 689.53 | **12.05×** | **147 MItems/s** |
+| **vulkan_radix_sort kv** | 85.55 | 1258.72 | **14.71×** | 98 MItems/s |
+| VkRadixSort Multi keys | 133.11 | 689.53 | 5.18× | 63 MItems/s |
+| CPU std::sort | — | 689.53 | 1.00× | 12 MItems/s |
 
-### 5. Scaling Analysis
+### 4. Scaling Analysis
 
 How time grows when data doubles (ideal = 2.00×):
 
 | Transition | CPU | vulkan_radix_sort | VkRadixSort |
 |:----------:|:---:|:-----------------:|:-----------:|
-| 1M → 2M | 2.12× | **1.95×** | 2.06× |
-| 2M → 4M | 2.10× | **1.95×** | 2.03× |
-| 4M → 8M | 2.15× | **1.99×** | **3.43×** ⚠️ |
+| 1M → 2M | 2.10× | **1.95×** | 2.06× |
+| 2M → 4M | 2.08× | **1.97×** | 2.02× |
+| 4M → 8M | 2.19× | **1.99×** | **3.47×** ⚠️ |
 
-**vulkan_radix_sort scales nearly linearly** (1.95–1.99×) across all sizes — the GPU is not yet saturated even at 8M, maintaining 139–147 MItems/s throughput.
+**vulkan_radix_sort scales nearly linearly** (1.95–1.99×) — the GPU is not yet saturated even at 8M, maintaining 139–147 MItems/s throughput.
 
-**VkRadixSort degrades at 4M→8M**: time grows 3.43× for 2× data. This confirms the degradation is **algorithmic, not DVFS-related** — locking DDR to 4.8 GHz did not fix it. The root cause is the scatter shader's O(num_workgroups) global memory reads for histogram prefix sum (1024 WGs × 256 bins × 4 bytes = 1 GB at 8M).
+**VkRadixSort degrades at 4M→8M**: time grows 3.47× for 2× data. Root cause: the scatter shader reads ALL workgroup histograms from global memory for prefix sum — at 8M with 1024 workgroups, this is 1024 × 256 × 4 bytes = 1 MB of global memory reads per workgroup, totaling ~1 GB across all workgroups.
 
-### 6. Why vulkan_radix_sort Wins at All Sizes
+### 5. Why the Gap Widens at Large N
 
 | Factor | vulkan_radix_sort | VkRadixSort Multi |
 |--------|-------------------|-------------------|
-| GPU latency floor | **~0.29 ms** (single cmd buffer) | ~0.39 ms (4 cmd buffers, semaphore-chained) |
-| Workgroup granularity | **2048 elem/WG** (more parallelism) | 8192 elem/WG (fewer WGs) |
-| Global prefix sum | Dedicated spine pass (fixed 32 WG) | Scatter inlines O(num_WG) reads |
-| WG-internal ranking | **subgroup ballot** (hardware) | bin_flags 8 KB shared memory |
+| Global prefix sum | Dedicated spine pass (fixed 32 WG) | Scatter inlines O(num_WG) global reads |
+| WG-internal ranking | **subgroup ballot** (hardware, zero cost) | bin_flags 8 KB shared memory |
 | Atomics per element | ~1/32 (waveOffset==0 only) | 1 atomicAdd per element |
+| Memory per sort | N × 4B (in-place) | 2N × 4B (ping-pong) |
+| Workgroup granularity | 2048 elem/WG | 8192 elem/WG |
 
-### 7. CPU Scaling
+### 6. CPU Scaling
 
 CPU `std::sort` at locked 2.75 GHz follows O(N log N) exactly. The normalized time T/(N·log₂N) converges to **~3.4 ns** for N ≥ 16K, which is ~9.4 clock cycles per comparison-swap on the Cortex core.
 
@@ -188,17 +170,18 @@ All measurements use identical methodology:
 4. **Same timestamp stage**: `VK_PIPELINE_STAGE_ALL_COMMANDS_BIT` for all timestamps
 5. **Same measurement type**: GPU timestamp envelope (first→last timestamp), not per-pass sum
 6. **Same pipeline policy**: Vulkan pipeline created once, reused across all sizes
-7. **Same frequency**: All DVFS domains locked to max (GPU 933 MHz, DDR 4.8 GHz, CPU 2.75 GHz)
-8. **Correctness verified**: Each run verified against CPU `std::sort` result
+7. **Same submit pattern**: Both use **single command buffer, single submit** (no semaphores)
+8. **Same frequency**: All DVFS domains locked to max (GPU 933 MHz, DDR 4.8 GHz, CPU 2.75 GHz)
+9. **Correctness verified**: Each run verified against CPU `std::sort` result
 
 ### Remaining inherent differences
 
 | Aspect | vulkan_radix_sort | VkRadixSort Multi |
 |--------|-------------------|-------------------|
-| Submit pattern | Single command buffer per sort | 4 command buffers, semaphore-chained |
 | Dispatch count | 12 (3 × 4 passes) | 8 (2 × 4 passes) |
 | Pipeline barriers | Between upsweep/spine/downsweep | Between histogram/scatter |
-| Timestamp count | 2 (single envelope) | 8 (envelope from first to last) |
+| Descriptor binding | VK_KHR_push_descriptor | Traditional descriptor sets |
+| Memory layout | N × 4B (in-place) | 2N × 4B (ping-pong) |
 
 These are inherent to each algorithm's design and represent real-world performance characteristics.
 
