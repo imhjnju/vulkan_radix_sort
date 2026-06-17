@@ -150,11 +150,13 @@ How time grows when data doubles (ideal = 2.00×):
 
 | Factor | vulkan_radix_sort | VkRadixSort Multi |
 |--------|-------------------|-------------------|
-| Global prefix sum | Dedicated spine pass (fixed 32 WG) | Scatter inlines O(num_WG) global reads |
+| Global prefix sum | Dedicated spine pass (fixed 32 WG, O(1) read) | Scatter inlines O(num_WG) global reads |
 | WG-internal ranking | **subgroup ballot** (hardware, zero cost) | bin_flags 8 KB shared memory |
 | Atomics per element | ~1/32 (waveOffset==0 only) | 1 atomicAdd per element |
-| Memory per sort | N × 4B (in-place) | 2N × 4B (ping-pong) |
+| Memory layout | keys ↔ storage.inout ping-pong (~2N) | buffer0 ↔ buffer1 ping-pong (~2N) |
 | Workgroup granularity | 2048 elem/WG | 8192 elem/WG |
+
+> **Note**: Both implementations use ping-pong buffers of ~2N size — vulkan_radix_sort swaps `keysBuffer` ↔ `storageBuffer.inout` between even/odd passes (see `vk_radix_sort.h:1404-1414`), VkRadixSort swaps `buffer0` ↔ `buffer1`. Memory footprint is roughly equal (~64-65 MB at 8M), so the 8M degradation is purely algorithmic, not memory-pressure.
 
 ### 6. CPU Scaling
 
@@ -181,9 +183,73 @@ All measurements use identical methodology:
 | Dispatch count | 12 (3 × 4 passes) | 8 (2 × 4 passes) |
 | Pipeline barriers | Between upsweep/spine/downsweep | Between histogram/scatter |
 | Descriptor binding | VK_KHR_push_descriptor | Traditional descriptor sets |
-| Memory layout | N × 4B (in-place) | 2N × 4B (ping-pong) |
+| Memory layout | keys ↔ storage.inout ping-pong (~2N) | buffer0 ↔ buffer1 ping-pong (~2N) |
 
 These are inherent to each algorithm's design and represent real-world performance characteristics.
+
+## Workgroup Size Tuning (vulkan_radix_sort)
+
+vulkan_radix_sort's performance is governed by three constants that must stay **consistent across the host and all three shaders** (upsweep/spine/downsweep):
+
+```cpp
+constexpr uint32_t RADIX             = 256;   // 4 passes × 8 bits
+constexpr int      WORKGROUP_SIZE    = 256;   // local_size_x in every shader
+constexpr int      PARTITION_DIVISION = 8;    // blocks per workgroup
+constexpr int      PARTITION_SIZE    = 8 * 256 = 2048;  // elements per workgroup
+```
+
+### Parameter-by-parameter impact
+
+#### 1. WORKGROUP_SIZE = 256 — device-constrained, NOT a free parameter
+
+This is the workgroup thread count (`local_size_x`). On Maleoon 935 it is **capped at 256**:
+
+- `WORKGROUP_SIZE = 512` (the desktop default) compiles fine but causes **`VK_ERROR_DEVICE_LOST`** during queue execution — see [HARMONYOS_MALEOON.md](HARMONYOS_MALEOON.md). So 256 is the hard ceiling on this GPU, not a tuning choice.
+- **Register/shared-memory pressure** (downsweep): `localHistogram[2048]` = 8 KB + `localHistogramSum[256]` = 1 KB + `subgroupSums[8]` ≈ **9 KB/WG**. With `maxSharedMemory = 32 KB`, at most ~3 workgroups can be resident per compute unit, capping occupancy. Raising WORKGROUP_SIZE would worsen this even if the device allowed it.
+
+#### 2. PARTITION_DIVISION = 8 — the main algorithmic knob
+
+Each workgroup processes `PARTITION_DIVISION` blocks of `WORKGROUP_SIZE` keys, i.e. **2048 keys/WG**. This trades launch overhead against resource pressure:
+
+| Larger PARTITION_DIVISION (e.g. 16 → 4096 keys/WG) | Smaller PARTITION_DIVISION (e.g. 4 → 1024 keys/WG) |
+|---|---|
+| Fewer workgroups → fewer dispatches, less launch overhead | More workgroups → better GPU occupancy |
+| **Spine scans fewer partitions** (O(partitionCount) shrinks) | Spine scans more partitions |
+| Downsweep threads hold more registers (`localKeys[8]`→`[16]`, etc.) | Fewer registers per thread |
+| Shared memory `localHistogram[PARTITION_SIZE]` grows linearly → lower occupancy | Shared memory smaller → higher occupancy |
+
+The value **8** is an empirically tuned compromise: large enough that spine's `O(partitionCount)` scan stays cheap at 8M (4096 partitions), small enough that downsweep's 9 KB shared memory leaves room for occupancy. It is the most impactful tunable but changing it requires re-measuring at multiple N — small N favors larger divisions (fewer dispatches), large N favors smaller (more parallelism + occupancy).
+
+#### 3. subgroupSize = 32 — queryable, can be requested via extension
+
+Maleoon 935 reports subgroupSize = 32. The benchmark requests it explicitly via `VK_EXT_subgroup_size_control` (`requiredSubgroupSize = 32`). It affects two things:
+
+- **Spine dispatch count**: `RoundUp(256, 256/32) = 32 workgroups` (fixed, independent of N). A larger subgroup size (e.g. 64) would reduce this to 16, but is hardware-limited.
+- **Wave count per workgroup**: `waveCount = 256/32 = 8` in downsweep. More subgroup operations run in lockstep, affecting ballot granularity.
+
+Changing it is only possible within the device's `[minSubgroupSize, maxSubgroupSize]` range — for Maleoon 935 that range is narrow, so it's effectively fixed.
+
+### Derived quantities (not independently tunable)
+
+| Quantity | Formula | Value at 8M |
+|----------|---------|:-----------:|
+| Partition count | `ceil(N / 2048)` | 4096 |
+| Upsweep dispatch | `partitionCount` | 4096 WG |
+| Spine dispatch | `RoundUp(256, 256/subgroupSize)` | **32 WG** (fixed) |
+| Downsweep dispatch | `partitionCount` | 4096 WG |
+| Storage buffer size | `(4 + 4·256 + 4096·256) × 4 B` | ~4 MB |
+| Per-WG shared mem (downsweep) | `2048 + 256 + 8` uints | ~9 KB |
+
+### Summary: what's actually tunable on this device
+
+| Parameter | Tunable? | Constraint |
+|-----------|:--------:|-----------|
+| WORKGROUP_SIZE | ❌ | Capped at 256 (512 = device lost) |
+| PARTITION_DIVISION | ✅ | Main knob, 8 is tuned default; affects occupancy vs launch overhead |
+| subgroupSize | ⚠️ | Narrow range on Maleoon 935, effectively 32 |
+| RADIX | ❌ | Tied to 8-bit radix = 4 passes, algorithmic |
+
+The only parameter worth experimenting with is **PARTITION_DIVISION** (e.g. try 4, 8, 16), but it requires rebuilding shaders and re-benchmarking across the full N range since the optimal value shifts with problem size.
 
 ## Device Info
 
