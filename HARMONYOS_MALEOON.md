@@ -17,6 +17,19 @@ vkWaitForFences wait=-4
 
 `-4` is `VK_ERROR_DEVICE_LOST`. The first GPU output value also stayed equal to the unsorted input value, while the CPU reference path passed.
 
+## Root cause (corrected after investigation)
+
+The device-lost was **not a hardware/driver incompatibility with WG_SIZE=512** — it was shader bugs that only manifest when `WORKGROUP_SIZE > RADIX` (256). The original shaders assumed `WORKGROUP_SIZE == RADIX == 256` in several places:
+
+1. **spine.comp**: a `barrier()` sat inside `if (index < RADIX)`, which is non-uniform when `WG_SIZE > RADIX` → GPU hang reported as device-lost.
+2. **downsweep.comp**: `localHistogramSum[index]` and `wave*RADIX + index` writes were out-of-bounds for `index >= RADIX`; `subgroupSums[8]` was hardcoded (needs `WG_SIZE/32`).
+
+These are fixed (see commits). With the fixes, WG_SIZE=512 runs correctly on Maleoon 935.
+
+## Why 256 is still the default
+
+Design-space exploration (see [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) § Design-Space Exploration) shows 256×8 is optimal overall: faster at small/medium N, tied at large N for keys-only. 512×8 only wins for large-N key-value sorts (~9% at 8M). So 256 stays the default — but it is now a **performance** choice, not a compatibility workaround.
+
 ## Key compatibility change
 
 Use `WORKGROUP_SIZE = 256` for HarmonyOS/Maleoon compatibility.

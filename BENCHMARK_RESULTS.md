@@ -244,12 +244,54 @@ Changing it is only possible within the device's `[minSubgroupSize, maxSubgroupS
 
 | Parameter | Tunable? | Constraint |
 |-----------|:--------:|-----------|
-| WORKGROUP_SIZE | ❌ | Capped at 256 (512 = device lost) |
-| PARTITION_DIVISION | ✅ | Main knob, 8 is tuned default; affects occupancy vs launch overhead |
+| WORKGROUP_SIZE | ✅ (256 or 512) | Must be ≥ RADIX=256; 256 is optimal (see Design-Space Exploration below) |
+| PARTITION_DIVISION | ❌ | **Hardcoded to 8** by downsweep's localHistogram layout (`RADIX*waveCount` on init line) — not a free parameter |
 | subgroupSize | ⚠️ | Narrow range on Maleoon 935, effectively 32 |
 | RADIX | ❌ | Tied to 8-bit radix = 4 passes, algorithmic |
 
-The only parameter worth experimenting with is **PARTITION_DIVISION** (e.g. try 4, 8, 16), but it requires rebuilding shaders and re-benchmarking across the full N range since the optimal value shifts with problem size.
+**Earlier claim that "WORKGROUP_SIZE=512 causes device lost" was wrong.** The real cause was shader bugs (non-uniform barrier in spine, out-of-bounds writes in downsweep) that only manifest when WG_SIZE > RADIX. These are now fixed — 512 runs correctly. Design-space exploration (below) shows 256 remains the better default.
+
+## Design-Space Exploration (WG_SIZE × PARTITION_DIVISION)
+
+Systematic sweep of WG ∈ {256, 512} × PD ∈ {4, 8, 16}, measured at representative N (4K/64K/1M/8M), all frequencies locked:
+
+### Keys (ms, median of 10)
+
+| Config | 4K | 64K | 1M | 8M | Notes |
+|--------|---:|----:|---:|---:|-------|
+| **256×8** | **0.309** | **0.648** | 7.685 | 58.41 | **optimal default** |
+| 512×8 | 0.369 | 0.680 | **7.507** | **57.80** | large-N marginally faster |
+| 256×16 | 0.430 | 0.981 | 12.74 | 102.6 | slowest — PD=16 just adds register pressure |
+| 256×4 | — | — | — | — | ❌ correctness fails (PD<8) |
+| 512×4 | — | — | — | — | ❌ correctness fails (PD<8) |
+| 512×16 | — | — | — | — | ❌ shared memory 33KB > 32KB limit |
+
+### Key-Value (ms, median of 10)
+
+| Config | 4K | 64K | 1M | 8M |
+|--------|---:|----:|---:|---:|
+| **256×8** | **0.351** | **0.813** | 11.27 | 86.95 |
+| 512×8 | 0.408 | 0.843 | **10.35** | **79.23** |
+| 256×16 | 0.513 | 1.306 | 17.71 | 140.4 |
+
+### Findings
+
+1. **PARTITION_DIVISION is constrained to 8**, not a tuning knob:
+   - downsweep initializes `localHistogram` with `for (i < RADIX*waveCount)` = `WG*8` slots, but declares it as `[PARTITION_SIZE]` = `[PD*WG]`. Correct only when `PD == RADIX/subgroupSize == 8`.
+   - PD=4 → array too small → OOB write → corruption.
+   - PD=16 → works but `localHistogram` is oversized (wastes shared memory) and adds per-thread register pressure (`localKeys[16]` etc.) with zero benefit → strictly slower.
+   - PD only controls keys-per-thread; the histogram layout (`[waveCount][RADIX]`) is independent of PD.
+
+2. **WORKGROUP_SIZE: 256 beats 512 overall**:
+   - Small N (≤64K): 256 is 7–17% faster — same dispatch count (1 partition), but 512's larger per-WG synchronization cost and lower occupancy hurt.
+   - Large N keys (≥1M): tied (512 at most 1% faster).
+   - Large N kv (≥1M): 512 is ~9% faster (79.2 vs 87.0 ms at 8M) — kv's extra values-scatter is more atomic-sensitive, and 512 halves the global atomic count.
+
+3. **512×16 hits the shared-memory wall**: `localHistogram[8192]` (32KB) + `localHistogramSum[256]` (1KB) + `subgroupSums` > `maxSharedMemory` (32KB).
+
+### Verdict
+
+**256×8 is the optimal default** — fastest at small/medium N, tied at large N keys. The only case where 512×8 wins is **large-N key-value sort** (~9% at 8M). If a workload is exclusively large kv sorts, 512×8 is worth selecting; otherwise 256×8.
 
 ## Device Info
 

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/vulkanmemoryallocator-subbuild/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

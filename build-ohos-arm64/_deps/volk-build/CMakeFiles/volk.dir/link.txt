@@ -1,0 +1,2 @@
+/home/huang/harmonyos/linux/native/llvm/bin/llvm-ar qc libvolk.a CMakeFiles/volk.dir/volk.c.o
+/home/huang/harmonyos/linux/native/llvm/bin/llvm-ranlib libvolk.a

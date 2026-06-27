@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#ifdef __linux__
 #include <sched.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -13,6 +15,7 @@ int64_t GetTimestamp() {
 }
 
 void PinToBigCores() {
+#ifdef __linux__
   cpu_set_t set;
   CPU_ZERO(&set);
   // cpu12-13: 2.75 GHz big cores
@@ -21,6 +24,7 @@ void PinToBigCores() {
   if (sched_setaffinity(getpid(), sizeof(set), &set) != 0) {
     std::cerr << "Warning: failed to pin CPU benchmark to big cores" << std::endl;
   }
+#endif
 }
 
 }  // namespace

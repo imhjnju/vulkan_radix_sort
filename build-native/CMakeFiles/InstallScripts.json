@@ -1,0 +1,9 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-native/cmake_install.cmake",
+		"/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-native/_deps/volk-build/cmake_install.cmake",
+		"/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-native/_deps/vulkanmemoryallocator-build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/CMakeFiles/volk-populate"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/CMakeFiles/volk-populate.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/CMakeFiles/volk-populate-complete.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/volk-populate-prefix/src/volk-populate-stamp/volk-populate-build.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/volk-populate-prefix/src/volk-populate-stamp/volk-populate-configure.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/volk-populate-prefix/src/volk-populate-stamp/volk-populate-download.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/volk-populate-prefix/src/volk-populate-stamp/volk-populate-install.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/volk-populate-prefix/src/volk-populate-stamp/volk-populate-mkdir.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/volk-populate-prefix/src/volk-populate-stamp/volk-populate-patch.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/volk-populate-prefix/src/volk-populate-stamp/volk-populate-test.rule"
+		},
+		{
+			"file" : "/home/huang/Graph/RadixSort/benchmark_repos/vulkan_radix_sort/build-mingw/_deps/volk-subbuild/volk-populate-prefix/src/volk-populate-stamp/volk-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"volk-populate"
+		],
+		"name" : "volk-populate"
+	}
+}

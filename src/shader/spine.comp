@@ -58,22 +58,28 @@ void main() {
 
     if (gl_WorkGroupID.x == 0) {
         barrier();
+        // All threads participate in the subgroup scan; out-of-range threads
+        // contribute 0. This keeps barriers and subgroup ops uniform across the
+        // whole workgroup (required when WORKGROUP_SIZE > RADIX, e.g. 512).
+        uint value = (index < RADIX) ? globalHistogram[RADIX * uint(pc.pass) + index] : 0;
+        uint excl = subgroupExclusiveAdd(value);
+        uint sum = subgroupAdd(value);
+
+        if (subgroupElect()) {
+            intermediate[waveIndex] = sum;
+        }
+        barrier();
+
+        // Cross-subgroup prefix sum on intermediate[]. All threads participate;
+        // only the first RADIX/laneCount carry real data.
+        uint intermediateValue = (index < RADIX / laneCount) ? intermediate[index] : 0;
+        uint intermediateExcl = subgroupExclusiveAdd(intermediateValue);
+        if (index < RADIX / laneCount) {
+            intermediate[index] = intermediateExcl;
+        }
+        barrier();
+
         if (index < RADIX) {
-            uint value = globalHistogram[RADIX * uint(pc.pass) + index];
-            uint excl = subgroupExclusiveAdd(value);
-            uint sum = subgroupAdd(value);
-
-            if (subgroupElect()) {
-                intermediate[waveIndex] = sum;
-            }
-            barrier();
-
-            if (index < RADIX / laneCount) {
-                uint intermediateExcl = subgroupExclusiveAdd(intermediate[index]);
-                intermediate[index] = intermediateExcl;
-            }
-            barrier();
-
             excl += intermediate[waveIndex];
             globalHistogram[RADIX * uint(pc.pass) + index] = excl;
         }

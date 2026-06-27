@@ -1,0 +1,3 @@
+/home/huang/.local/lib/python3.12/site-packages/cmake/data/bin/cmake -E rm -f CMakeFiles/bench.dir/objects.a
+/usr/bin/x86_64-w64-mingw32-ar qc CMakeFiles/bench.dir/objects.a @CMakeFiles/bench.dir/objects1.rsp
+/usr/bin/x86_64-w64-mingw32-g++ -O3 -DNDEBUG -static-libgcc -static-libstdc++ -Wl,--allow-multiple-definition -Wl,--whole-archive CMakeFiles/bench.dir/objects.a -Wl,--no-whole-archive -o bench.exe -Wl,--out-implib,libbench.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles/bench.dir/linkLibs.rsp

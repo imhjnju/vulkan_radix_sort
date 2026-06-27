@@ -47,7 +47,7 @@ layout(set = 0, binding = 6, std430) buffer ValuesOut {
 
 shared uint localHistogram[PARTITION_SIZE];
 shared uint localHistogramSum[RADIX];
-shared uint subgroupSums[8];
+shared uint subgroupSums[WORKGROUP_SIZE / 32];  // waveCount = WG_SIZE / subgroupSize (>=32)
 
 uvec4 getExclusiveWaveMask(uint laneIndex) {
     uvec4 mask = uvec4(0);
@@ -130,14 +130,21 @@ void main() {
 
         uint radixTotal = 0;
         for (uint wave = 0; wave < waveCount; ++wave) {
-            uint histogramIndex = wave * RADIX + index;
-            uint count = localHistogram[histogramIndex];
-            localHistogram[histogramIndex] = radixTotal;
-            radixTotal += count;
+            // Guard: each thread maps to one radix (index == radix id).
+            // Required when WORKGROUP_SIZE > RADIX (e.g. 512): extra threads stay idle.
+            if (index < RADIX) {
+                uint histogramIndex = wave * RADIX + index;
+                uint count = localHistogram[histogramIndex];
+                localHistogram[histogramIndex] = radixTotal;
+                radixTotal += count;
+            }
         }
 
         uint subgroupCount = subgroupAdd(radixTotal);
-        localHistogramSum[index] = subgroupExclusiveAdd(radixTotal);
+        uint exclSum = subgroupExclusiveAdd(radixTotal);
+        if (index < RADIX) {
+            localHistogramSum[index] = exclSum;  // guard: localHistogramSum has RADIX slots
+        }
         if (laneIndex == 0) {
             subgroupSums[waveIndex] = subgroupCount;
         }
@@ -147,7 +154,9 @@ void main() {
         for (uint subgroup = 0; subgroup < waveIndex; ++subgroup) {
             subgroupPrefix += subgroupSums[subgroup];
         }
-        localHistogramSum[index] += subgroupPrefix;
+        if (index < RADIX) {
+            localHistogramSum[index] += subgroupPrefix;
+        }
         barrier();
 
         for (uint i = 0; i < PARTITION_DIVISION; ++i) {
